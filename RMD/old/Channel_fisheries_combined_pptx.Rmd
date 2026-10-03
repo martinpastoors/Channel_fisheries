@@ -1,0 +1,380 @@
+---
+title: "Generate PowerPoint — Channel Fisheries Figures"
+output:
+  html_document:
+    toc: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = FALSE,   # hide all R code — this script is a build tool, not a report
+  warning = FALSE,
+  message = FALSE,
+  results = "hide",  # suppress printed console output (e.g. msg() calls, data summaries)
+  fig.show = "hide"  # suppress inline plot display — plots still render into the PPTX,
+                      # they're just not also shown in this HTML log
+)
+```
+
+# Generate a 4:3 PowerPoint deck from the report figures
+
+This script builds a 4:3 PowerPoint deck from every figure in
+`channel_fisheries_combined_report.Rmd`, reusing that report's exact
+data-loading and plotting code (no figures are retyped or redrawn from
+scratch). Knitting this file produces:
+
+- `output/channel_fisheries_figures.pptx` — the deck (the actual deliverable)
+- a short HTML log confirming the build completed (this document)
+
+**Before running:** knit (or at least run) the main report once so that
+`output/cache/*.RData` exist. This script loads those caches directly — it does
+not need the raw AER Excel file or GFW pipeline `.RData` files to be present,
+only the cache.
+
+Save this file in the **same folder** as `channel_fisheries_combined_report.Rmd`
+(or edit `main_rmd` below), then knit.
+
+```{r packages}
+library(tidyverse)
+library(officer)
+library(sf)
+library(spatstat)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(ineq)
+library(patchwork)
+library(scales)
+```
+
+```{r register-chunks}
+# Path to the main report Rmd
+main_rmd <- "channel_fisheries_combined_report.Rmd"
+
+if (!file.exists(main_rmd)) {
+  stop("Cannot find '", main_rmd,
+       "'. Place this script in the same folder as the main report, ",
+       "or edit `main_rmd` to the correct path.")
+}
+
+# ---------------------------------------------------------------------------
+# NOTE ON IMPLEMENTATION: knitr::read_chunk() is NOT used here.
+# read_chunk() scans the *entire* source file (including prose) with a
+# regex-based chunk-boundary matcher, and on reports with very long lines of
+# prose (some paragraphs in the literature/discussion sections exceed 1000
+# characters) this can trigger a "node stack overflow" in R's PCRE engine.
+# extract_chunk() below does a simple, single-pass line scan instead — it
+# only looks for chunk fences and label headers, never runs a regex over
+# whole-paragraph text, and cannot suffer the same failure mode.
+# ---------------------------------------------------------------------------
+
+extract_chunk <- function(filepath, label) {
+  lines <- readLines(filepath, warn = FALSE)
+
+  fence_re <- "^```\\{r[ ]+([a-zA-Z0-9_.-]+)"
+  start_idx <- NA_integer_
+
+  for (i in seq_along(lines)) {
+    if (grepl("^```\\{r", lines[i], fixed = FALSE)) {
+      m <- regmatches(lines[i], regexpr(fence_re, lines[i]))
+      if (length(m) > 0) {
+        this_label <- sub(fence_re, "\\1", m)
+        if (identical(this_label, label)) {
+          start_idx <- i
+          break
+        }
+      }
+    }
+  }
+
+  if (is.na(start_idx)) {
+    stop("Chunk '", label, "' not found in ", filepath)
+  }
+
+  # Find the closing ``` fence after start_idx
+  end_idx <- NA_integer_
+  for (j in seq(start_idx + 1, length(lines))) {
+    if (identical(trimws(lines[j]), "```")) {
+      end_idx <- j
+      break
+    }
+  }
+  if (is.na(end_idx)) {
+    stop("Closing fence for chunk '", label, "' not found in ", filepath)
+  }
+
+  paste(lines[(start_idx + 1):(end_idx - 1)], collapse = "\n")
+}
+
+# run_chunk(): extracts a chunk's code and evaluates it in the calling
+# (global) environment, so subsequent chunks see the same objects exactly
+# as if the code had been pasted inline.
+#
+# IMPORTANT: a plain eval(parse(...)) does NOT auto-print top-level visible
+# results the way the R console does, which means a chunk ending in a bare
+# ggplot pipe (no explicit print()) would never register with last_plot().
+# To replicate console behaviour, each parsed expression is evaluated with
+# withVisible() and explicitly print()'d when visible — this is exactly what
+# let's a trailing `... |> ggplot(...) + ...` show up in last_plot().
+run_chunk <- function(label, filepath = main_rmd) {
+  code  <- extract_chunk(filepath, label)
+  exprs <- parse(text = code)
+  for (e in exprs) {
+    res <- withVisible(eval(e, envir = .GlobalEnv))
+    if (res$visible) print(res$value)
+  }
+  invisible(NULL)
+}
+```
+
+<!-- ===========================================================
+     Re-run settings, helpers and data loading from the main report.
+     run_chunk() extracts and evaluates the named chunk's code exactly
+     as written in the main Rmd — no retyping, no read_chunk() regex risk.
+     =========================================================== -->
+
+```{r settings}
+run_chunk("settings")
+```
+
+```{r helpers-gfw}
+run_chunk("helpers-gfw")
+```
+
+```{r helpers-aer}
+run_chunk("helpers-aer")
+```
+
+```{r helpers-fdi}
+run_chunk("helpers-fdi")
+```
+
+```{r load-aer}
+run_chunk("load-aer")
+```
+
+```{r load-gfw}
+run_chunk("load-gfw")
+```
+
+```{r load-gfw-spatial}
+run_chunk("load-gfw-spatial")
+```
+
+<!-- ===========================================================
+     PPTX SETUP
+     =========================================================== -->
+
+```{r pptx-settings}
+pptx_path <- file.path(out_dir, "channel_fisheries_figures.pptx")
+
+# 4:3 slide geometry (inches)
+slide_w <- 10
+slide_h <- 7.5
+margin  <- 0.3
+max_w   <- slide_w - 2*margin
+max_h   <- slide_h - 2*margin
+
+# Adds one ggplot/patchwork object as a full-bleed image slide, scaled to fit
+# within the slide while preserving its aspect ratio. No PowerPoint title
+# placeholder is added — every figure already carries its own title via
+# ggplot's labs(title = ...), so a redundant slide title is omitted.
+add_plot_slide <- function(doc, plot_obj, width_in = 8, height_in = 5) {
+
+  doc <- add_slide(doc, layout = "Blank", master = "Office Theme")
+
+  tmp_png <- tempfile(fileext = ".png")
+  ggsave(tmp_png, plot = plot_obj, width = width_in, height = height_in,
+         dpi = 220, units = "in", bg = "white")
+
+  asp <- width_in / height_in
+  if (max_w / max_h > asp) {
+    draw_h <- max_h
+    draw_w <- max_h * asp
+  } else {
+    draw_w <- max_w
+    draw_h <- max_w / asp
+  }
+  pos_x <- (slide_w - draw_w) / 2
+  pos_y <- (slide_h - draw_h) / 2
+
+  ph_with(doc, value = external_img(tmp_png, width = draw_w, height = draw_h),
+          location = ph_location(left = pos_x, top = pos_y,
+                                  width = draw_w, height = draw_h))
+}
+
+# 4:3 PowerPoint base document. If your local officer template defaults to
+# 16:9, supply a blank 4:3 .potx via `read_pptx(path = "template_4x3.potx")`
+# instead — see Annex note in the main report for where to source one.
+pptx <- read_pptx()
+```
+
+```{r slide-title}
+pptx <- add_slide(pptx, layout = "Title Slide", master = "Office Theme")
+pptx <- ph_with(pptx, value = "Fishing in the English Channel",
+                 location = ph_location_type(type = "ctrTitle"))
+pptx <- ph_with(pptx,
+                 value = "Trends in Fishing Effort, Landings and Spatial Distributions \u2014 STECF AER & GFW",
+                 location = ph_location_type(type = "subTitle"))
+```
+
+<!-- ===========================================================
+     FIGURE SLIDES
+     Each pair of chunks below: (1) re-runs the real figure code from the
+     main report, producing the plot object; (2) adds it to a slide.
+     width_in / height_in mirror the fig.width / fig.height set on the
+     original chunk in the main report, so proportions match exactly.
+     =========================================================== -->
+
+## Figure 1 — Fishing days by gear category (AER)
+
+```{r aer-effort-trend}
+run_chunk("aer-effort-trend")
+```
+
+```{r slide-fig01}
+pptx <- add_plot_slide(pptx, last_plot(), width_in = 8, height_in = 6)
+```
+
+## Figure 2 — Fishing days by country, gear and vessel size (AER)
+
+```{r aer-effort-gt}
+run_chunk("aer-effort-gt")
+```
+
+```{r slide-fig02}
+pptx <- add_plot_slide(pptx, last_plot(), width_in = 8, height_in = 9)
+```
+
+## Figure 4 — Landed weight by gear category (AER)
+
+```{r aer-landings-total}
+run_chunk("aer-landings-total")
+```
+
+```{r slide-fig04}
+pptx <- add_plot_slide(pptx, last_plot(), width_in = 8, height_in = 6)
+```
+
+## Figure 5 — Landings by species group and country (AER)
+
+```{r aer-landings-species-country}
+run_chunk("aer-landings-species-country")
+```
+
+```{r slide-fig05}
+pptx <- add_plot_slide(pptx, last_plot(), width_in = 10, height_in = 7)
+```
+
+## Figure 6 — Landings by species group and gear category (AER)
+
+```{r aer-landings-species-gear}
+run_chunk("aer-landings-species-gear")
+```
+
+```{r slide-fig06}
+pptx <- add_plot_slide(pptx, last_plot(), width_in = 10, height_in = 7)
+```
+
+## Figure 7 — Focal species by focal gear category (AER)
+
+```{r aer-landings-focal}
+run_chunk("aer-landings-focal")
+```
+
+```{r slide-fig07}
+pptx <- add_plot_slide(pptx, last_plot(), width_in = 11, height_in = 8)
+```
+
+## Figure 8 — Top 15 species by landed weight (AER)
+
+```{r aer-landings-top-species}
+run_chunk("aer-landings-top-species")
+```
+
+```{r slide-fig08}
+pptx <- add_plot_slide(pptx, last_plot(), width_in = 8, height_in = 5)
+```
+
+## Figure 10 — GFW fishing days by flag state
+
+```{r gfw-plot-flag-total}
+run_chunk("gfw-plot-flag-total")
+```
+
+```{r slide-fig10}
+pptx <- add_plot_slide(pptx, last_plot(), width_in = 8, height_in = 5)
+```
+
+## Figure 11 — AER vs GFW effort comparison
+
+```{r aer-gfw-comparison}
+run_chunk("aer-gfw-comparison")
+```
+
+```{r slide-fig11}
+pptx <- add_plot_slide(pptx, last_plot(), width_in = 8, height_in = 5)
+```
+
+## Figure 12 — Spatial distribution of fishing events, all years
+
+```{r gfw-plot-spatial-all}
+run_chunk("gfw-plot-spatial-all")
+```
+
+```{r slide-fig12}
+pptx <- add_plot_slide(pptx, last_plot(), width_in = 8, height_in = 6)
+```
+
+## Figure 13 — Spatial distribution of fishing events by year
+
+```{r gfw-plot-spatial-by-year}
+run_chunk("gfw-plot-spatial-by-year")
+```
+
+```{r slide-fig13}
+pptx <- add_plot_slide(pptx, last_plot(), width_in = 8, height_in = 12)
+```
+
+## Figure 14 — Kernel density, all divisions
+
+```{r gfw-plot-kde}
+run_chunk("gfw-plot-kde")
+```
+
+```{r slide-fig14}
+pptx <- add_plot_slide(pptx, last_plot(), width_in = 8, height_in = 10)
+```
+
+## Figure 15 — Kernel density, ICES 27.7.D
+
+```{r gfw-plot-kde-7d}
+run_chunk("gfw-plot-kde-7d")
+```
+
+```{r slide-fig15}
+pptx <- add_plot_slide(pptx, last_plot(), width_in = 8, height_in = 10)
+```
+
+## Figure 16 — Gini coefficient and top-10% cell share
+
+```{r gfw-plot-concentration}
+run_chunk("gfw-plot-concentration")
+```
+
+```{r slide-fig16}
+# Figure 16 is a patchwork object (p_gini + p_top10 via plot_annotation()).
+# ggsave() handles patchwork objects the same way as plain ggplot objects,
+# and last_plot() captures the most recently *printed* plot — patchwork
+# objects auto-print at the end of the chunk just like ggplot objects do.
+pptx <- add_plot_slide(pptx, last_plot(), width_in = 9, height_in = 4)
+```
+
+<!-- ===========================================================
+     SAVE
+     =========================================================== -->
+
+```{r pptx-save, results="markup"}
+invisible(print(pptx, target = pptx_path))
+cat("PowerPoint saved to:", pptx_path, "\n",
+    "Number of slides:", length(pptx), "\n")
+```

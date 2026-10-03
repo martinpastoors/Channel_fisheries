@@ -1,0 +1,810 @@
+---
+title: "GFW vs CV Electronic Logbook — Effort Comparison"
+subtitle: "Overlap in fishing effort metrics between CV logbooks and GFW AIS-based data for the same vessels"
+author: "Martin Pastoors"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  word_document:
+    reference_docx: "../report_template.dotx"
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 8,
+  fig.height = 5,
+  dpi        = 150
+)
+```
+
+<!-- =========================================================
+     LIBRARIES
+     ========================================================= -->
+
+```{r libraries}
+library(tidyverse)
+library(lubridate)
+library(readxl)
+library(grid)
+library(gridExtra)
+```
+
+<!-- =========================================================
+     SETTINGS — edit paths here
+     ========================================================= -->
+
+```{r settings}
+# ---- Directory paths --------------------------------------------------------
+flyshootdata  <- "C:/Users/MartinPastoors/Martin Pastoors/FLYSHOOT - General/data"
+flyshootrdata <- "C:/Users/MartinPastoors/Martin Pastoors/FLYSHOOT - General/rdata"
+
+# CV vessel info: must contain columns 'vessel' (short code) and 'mmsi'
+cv_vessel_file <- file.path(flyshootdata, "flyshoot vessels CV.xlsx")
+
+# CV electronic logbook data
+cv_elog_file <- file.path(flyshootrdata, "elog.RData")
+cv_elog_type <- "rdata"   # "rdata" | "parquet" | "csv"
+
+# ---- Study settings ---------------------------------------------------------
+study_years <- 2013:2025
+study_divs  <- c("27.4.C", "27.7.D", "27.7.E")
+
+# ---- Vessel name mapping ----------------------------------------------------
+# Maps GFW vessel_name values to short CV vessel codes.
+vessel_name_map <- c(
+  "JOHANNA SL-9"       = "SL9",
+  "SL-9 JOHANNA"       = "SL9",
+  "SCH-135 GALIBIER"   = "SCH135",
+  "SCH-144 VERTROUWEN" = "SCH144",
+  "SCH-99 ARAVIS"      = "SCH99",
+  "SCH65 SIMPLON"      = "SCH65"
+  # Add further vessels here: "GFW_NAME" = "CV_CODE"
+)
+
+# ---- Colour scheme ----------------------------------------------------------
+source_colours <- c("GFW" = "#4E79A7", "CV" = "#E15759")
+```
+
+---
+
+# 1. Introduction
+
+This report compares fishing effort derived from two independent data sources for the same set of vessels:
+
+1. **GFW (Global Fishing Watch)** — AIS-based effort derived from the `Extract_GFW_effort_v7.R` pipeline. Fishing events are identified using a machine-learning classifier applied to vessel speed and movement patterns. Each unique calendar date with at least one classified fishing event is counted as one fishing day.
+
+2. **CV electronic logbook (elog)** — haul-level trip records submitted by vessel operators. Each unique calendar date with at least one recorded haul within the study divisions is counted as one fishing day.
+
+The effort metric used throughout is **unique fishing days per vessel × year × ICES division**. The study area covers ICES divisions `r paste(study_divs, collapse = ", ")` and the time series spans `r min(study_years)`–`r max(study_years)`.
+
+---
+
+# 2. Data and Methods
+
+## 2.1 GFW effort data
+
+GFW effort data are loaded from the Stage 7 pipeline output (`gfw_s7_effort.RData`). The object `fishing_days_study` contains pre-aggregated annual fishing days per vessel, ICES division, and quarter, with the following key fields:
+
+| Field | Description |
+|---|---|
+| `ssvid` | AIS vessel identifier (MMSI) |
+| `vessel_name` | Vessel name as recorded in AIS transmissions |
+| `division` | ICES division |
+| `year` | Calendar year |
+| `fishing_days` | Annual fishing days (GFW classifier) |
+
+GFW vessel names are mapped to the short CV vessel codes using the `vessel_name_map` defined in the settings block. Where no name match is found, vessel codes are recovered via MMSI lookup.
+
+## 2.2 CV electronic logbook data
+
+The CV elog is loaded from `elog.RData`. Required fields after loading are: `vessel` (short code), `date` (Date), and `faozone` (ICES division string, uppercased to `fao_division`).
+
+Fishing days are derived using a **majority-rule deduplication** procedure:
+
+1. Count hauls per vessel × date × division combination.
+2. Where a date spans multiple divisions, retain only the division with the most hauls.
+3. Aggregate to unique dates per vessel × year × division.
+
+This procedure avoids double-counting days that appear in two divisions in the logbook, and matches the aggregation approach used in the GFW pipeline.
+
+## 2.3 Agreement classification
+
+For the calendar heatmap analyses (Section 5), each fishing date is classified as one of three categories:
+
+| Colour | Category | Meaning |
+|---|---|---|
+| Green | **Both** | Date present in both GFW and CV logbook (agreement) |
+| Red | **CV only** | Date in logbook but no GFW fishing event recorded |
+| Blue | **GFW only** | Date in GFW but no corresponding logbook record |
+
+For the annual comparison (Section 4), agreement is defined as an absolute difference of ≤ 5 fishing days between sources.
+
+---
+
+# 3. Data loading
+
+```{r load-gfw}
+message("Loading GFW effort data ...")
+
+fishing_days_study <- local({
+  e <- new.env()
+  load(file.path(flyshootdata, "gfw_s7_effort.RData"), envir = e)
+  e$fishing_days_study
+})
+
+message("  fishing_days_study: ",
+        nrow(fishing_days_study), " rows | ",
+        n_distinct(fishing_days_study$ssvid), " vessels | ",
+        sum(fishing_days_study$fishing_days), " total days")
+```
+
+```{r load-cv-vessels}
+message("Loading CV vessel info ...")
+
+vessels_cv <- read_excel(cv_vessel_file) %>%
+  mutate(mmsi = as.character(mmsi)) %>%
+  filter(!is.na(mmsi), !is.na(vessel))
+
+message("  CV vessels loaded: ", nrow(vessels_cv), " rows")
+message("  Vessels: ", paste(sort(unique(vessels_cv$vessel)), collapse = ", "))
+
+# Verify all CV MMSIs appear in GFW data
+mmsi_in_gfw  <- unique(fishing_days_study$ssvid)
+mmsi_missing <- setdiff(vessels_cv$mmsi, mmsi_in_gfw)
+
+if (length(mmsi_missing) > 0) {
+  message("  WARNING: ", length(mmsi_missing),
+          " CV MMSIs not found in fishing_days_study:")
+  message("    ", paste(mmsi_missing, collapse = ", "))
+} else {
+  message("  All CV MMSIs present in GFW data")
+}
+```
+
+```{r load-cv-elog}
+message("Loading CV electronic logbook data (", cv_elog_type, ") ...")
+
+elog <- switch(cv_elog_type,
+
+  "rdata" = {
+    e <- new.env()
+    load(cv_elog_file, envir = e)
+    if (exists("elog", envir = e)) {
+      e$elog
+    } else {
+      stop("RData file does not contain 'elog'. ",
+           "Objects found: ", paste(ls(e), collapse = ", "))
+    }
+  },
+
+  "parquet" = {
+    if (!requireNamespace("arrow", quietly = TRUE))
+      stop("Package 'arrow' needed for parquet.")
+    arrow::read_parquet(cv_elog_file)
+  },
+
+  "csv" = {
+    read_csv(cv_elog_file, col_types = cols(.default = col_character()))
+  },
+
+  stop("Unknown cv_elog_type: '", cv_elog_type, "'.")
+)
+
+# Validate required columns
+required_cols <- c("vessel", "date", "faozone")
+missing_cols  <- setdiff(required_cols, names(elog))
+if (length(missing_cols) > 0)
+  stop("elog missing required columns: ", paste(missing_cols, collapse = ", "))
+
+# Standardise types
+elog <- elog %>%
+  mutate(
+    date         = as.Date(date),
+    fao_division = toupper(str_trim(faozone))
+  )
+
+message("  elog: ", nrow(elog), " rows | Date range: ",
+        format(min(elog$date, na.rm = TRUE)), " to ",
+        format(max(elog$date, na.rm = TRUE)))
+```
+
+---
+
+# 4. Annual fishing day comparison
+
+```{r derive-cv-fishing-days}
+# Step 1: count hauls per vessel × date × division
+cv_daily_zones <- elog %>%
+  filter(
+    !is.na(date), !is.na(vessel), !is.na(fao_division),
+    fao_division %in% study_divs,
+    year(date) %in% study_years
+  ) %>%
+  mutate(year = year(date), quarter = quarter(date)) %>%
+  group_by(vessel, date, year, quarter, division = fao_division) %>%
+  summarise(n_hauls = n(), .groups = "drop")
+
+# Step 2: majority rule — keep the dominant division per vessel-date
+cv_daily_dominant <- cv_daily_zones %>%
+  group_by(vessel, date, year, quarter) %>%
+  slice_max(n_hauls, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  dplyr::select(-n_hauls)
+
+# Step 3: aggregate to fishing days
+fishing_days_cv <- cv_daily_dominant %>%
+  group_by(vessel, year, quarter, division) %>%
+  summarise(fishing_days = n_distinct(date), .groups = "drop") %>%
+  left_join(
+    vessels_cv %>% dplyr::select(vessel, mmsi, any_of(c("flag", "gt", "gear"))),
+    by = "vessel"
+  ) %>%
+  mutate(source = "CV")
+```
+
+```{r derive-gfw-fishing-days}
+fishing_days_gfw_cv <- fishing_days_study %>%
+  filter(
+    ssvid    %in% vessels_cv$mmsi,
+    year     %in% study_years,
+    division %in% study_divs
+  ) %>%
+  mutate(vessel = vessel_name_map[vessel_name]) %>%
+  left_join(
+    vessels_cv %>% dplyr::select(mmsi, vessel_cv = vessel),
+    by = c("ssvid" = "mmsi")
+  ) %>%
+  mutate(vessel = coalesce(vessel, vessel_cv)) %>%
+  dplyr::select(-vessel_cv) %>%
+  filter(!is.na(vessel)) %>%
+  group_by(vessel, ssvid, vessel_name, vessel_flag, gear, gt,
+           size_class, division, zone, year, quarter) %>%
+  summarise(fishing_days = sum(fishing_days), .groups = "drop") %>%
+  mutate(source = "GFW")
+```
+
+```{r build-comparison-table}
+# Long format: one row per vessel × year × division × source
+fishing_days_gfw_cv_long <- bind_rows(
+
+  fishing_days_gfw_cv %>%
+    group_by(vessel, ssvid, vessel_flag, gear, gt, size_class,
+             division, year, source) %>%
+    summarise(fishing_days = sum(fishing_days), .groups = "drop"),
+
+  fishing_days_cv %>%
+    group_by(vessel, division, year, source) %>%
+    summarise(fishing_days = sum(fishing_days), .groups = "drop") %>%
+    left_join(
+      vessels_cv %>%
+        dplyr::select(vessel, ssvid = mmsi,
+                      any_of(c("vessel_flag" = "flag", "gt", "gear"))),
+      by = "vessel"
+    )
+)
+
+# Wide format for diagnostics
+fishing_days_wide <- fishing_days_gfw_cv_long %>%
+  pivot_wider(
+    id_cols     = c(vessel, division, year),
+    names_from  = source,
+    values_from = fishing_days,
+    values_fill = 0
+  ) %>%
+  mutate(
+    diff     = GFW - CV,
+    ratio    = if_else(CV > 0, GFW / CV, NA_real_),
+    pct_diff = if_else(CV > 0, (GFW - CV) / CV * 100, NA_real_),
+    agree    = abs(diff) <= 5,
+    direction = case_when(
+      diff >  5 ~ "GFW higher",
+      diff < -5 ~ "CV higher",
+      TRUE      ~ "Agreement"
+    )
+  ) %>%
+  arrange(vessel, division, year)
+```
+
+## 4.1 Summary statistics
+
+```{r summary-stats}
+fishing_days_wide %>%
+  summarise(
+    `Vessel-years`       = n(),
+    `Mean GFW days`      = round(mean(GFW, na.rm = TRUE), 1),
+    `Mean CV days`       = round(mean(CV,  na.rm = TRUE), 1),
+    `Mean difference`    = round(mean(diff, na.rm = TRUE), 1),
+    `Median difference`  = round(median(diff, na.rm = TRUE), 1),
+    `Mean ratio (GFW/CV)`= round(mean(ratio, na.rm = TRUE), 2),
+    `% agreement (±5 d)` = round(mean(agree, na.rm = TRUE) * 100, 1),
+    `GFW higher`         = sum(direction == "GFW higher"),
+    `CV higher`          = sum(direction == "CV higher"),
+    `Agreement`          = sum(direction == "Agreement")
+  ) %>%
+  t() %>%
+  as.data.frame() %>%
+  setNames("Value") %>%
+  tibble::rownames_to_column("Metric") %>%
+  knitr::kable(caption = "Overall comparison summary across all vessel-years.")
+```
+
+```{r agreement-by-vessel}
+fishing_days_wide %>%
+  group_by(Vessel = vessel) %>%
+  summarise(
+    Years          = n(),
+    `Mean GFW`     = round(mean(GFW),  1),
+    `Mean CV`      = round(mean(CV),   1),
+    `Mean diff`    = round(mean(diff), 1),
+    `Mean ratio`   = round(mean(ratio, na.rm = TRUE), 2),
+    `% agree`      = round(mean(agree) * 100, 1),
+    .groups        = "drop"
+  ) %>%
+  knitr::kable(caption = "Agreement statistics by vessel.")
+```
+
+```{r agreement-by-division}
+fishing_days_wide %>%
+  group_by(Division = division, Direction = direction) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  pivot_wider(names_from = Direction, values_from = n, values_fill = 0) %>%
+  knitr::kable(caption = "Agreement direction counts by ICES division.")
+```
+
+## 4.2 Annual fishing days — all divisions combined
+
+Figure 1 shows the total annual fishing days per vessel summed across divisions, comparing GFW and CV logbook records.
+
+```{r plot-annual-all-divisions, fig.cap="Figure 1. Annual fishing days per vessel (all divisions combined). Blue = GFW; red = CV logbook."}
+fishing_days_gfw_cv_long %>%
+  group_by(vessel, year, source) %>%
+  summarise(fishing_days = sum(fishing_days), .groups = "drop") %>%
+  ggplot(aes(x = year, y = fishing_days,
+             colour = source, shape = source, linetype = source)) +
+  theme_bw() +
+  geom_point(size = 2) +
+  geom_line(linewidth = 0.6, alpha = 0.8) +
+  scale_colour_manual(values = source_colours) +
+  scale_x_continuous(breaks = study_years) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5)) +
+  labs(x = "", y = "Fishing days", colour = "Source",
+       shape = "Source", linetype = "Source",
+       title = "GFW vs CV — annual fishing days by vessel (all divisions combined)") +
+  facet_wrap(~ vessel)
+```
+
+## 4.3 Annual fishing days — by vessel and ICES division
+
+Figure 2 disaggregates the same comparison by ICES division.
+
+```{r plot-annual-by-division, fig.cap="Figure 2. Annual fishing days per vessel and ICES division. Blue = GFW; red = CV logbook."}
+fishing_days_gfw_cv_long %>%
+  ggplot(aes(x = year, y = fishing_days,
+             colour = source, shape = source, linetype = source)) +
+  theme_bw() +
+  geom_point(size = 2) +
+  geom_line(linewidth = 0.6, alpha = 0.8) +
+  scale_colour_manual(values = source_colours) +
+  scale_x_continuous(breaks = study_years) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5)) +
+  labs(x = "", y = "Fishing days", colour = "Source",
+       shape = "Source", linetype = "Source",
+       title = "GFW vs CV — annual fishing days by vessel and ICES division") +
+  facet_grid(vessel ~ division)
+```
+
+## 4.4 Scatter plot — GFW vs CV fishing days
+
+Figure 3 shows a scatter plot of GFW against CV fishing days for all vessel-year-division combinations where both sources report non-zero days. Points above the 1:1 line indicate years where GFW reports more days than the logbook.
+
+```{r plot-scatter, fig.cap="Figure 3. Scatter plot of GFW vs CV fishing days (vessel × year × division). Dashed line = 1:1. Only years present in both sources included."}
+fishing_days_wide %>%
+  filter(GFW > 0, CV > 0) %>%
+  ggplot(aes(x = CV, y = GFW, colour = vessel)) +
+  theme_bw() +
+  geom_abline(slope = 1, intercept = 0,
+              linetype = "dashed", colour = "grey50") +
+  geom_point(size = 2.5, alpha = 0.7) +
+  scale_colour_brewer(palette = "Set1") +
+  coord_equal() +
+  labs(x = "CV logbook fishing days", y = "GFW fishing days",
+       colour = "Vessel",
+       title = "GFW vs CV fishing days — scatter (vessel × year × division)",
+       subtitle = paste0("Dashed line = perfect agreement | above line = GFW higher",
+                         "\nOnly vessel-years present in both sources"))
+```
+
+---
+
+# 5. Calendar heatmaps — daily overlap
+
+The calendar heatmap analysis compares the two sources at the individual day level, showing which fishing dates are recorded by both sources, which appear only in the logbook, and which appear only in GFW.
+
+```{r load-events-classified-fr}
+# Load events_classified_fr from the GFW Stage 6 pipeline output.
+# This is the same object used in the combined GFW/AER/FDI report.
+
+if (!exists("events_classified_fr")) {
+  s6_file <- file.path(flyshootdata, "gfw_s6_zones.RData")
+  if (file.exists(s6_file)) {
+    message("Loading events_classified_fr from: ", s6_file)
+    e <- new.env()
+    load(s6_file, envir = e)
+    if (exists("events_classified_fr", envir = e)) {
+      events_classified_fr <- e$events_classified_fr
+      message("  Loaded events_classified_fr: ",
+              nrow(events_classified_fr), " rows")
+    } else {
+      warning("gfw_s6_zones.RData found but does not contain 'events_classified_fr'. ",
+              "Objects: ", paste(ls(e), collapse = ", "),
+              "\nSections 5 and 6.3-6.4 will be skipped.")
+    }
+    rm(e)
+  } else {
+    warning("gfw_s6_zones.RData not found at: ", s6_file,
+            "\nSections 5 and 6.3-6.4 will be skipped.")
+  }
+}
+
+all_vessels <- sort(unique(vessels_cv$vessel))
+```
+
+```{r heatmap-per-vessel, fig.height=7, fig.cap="Calendar heatmaps of fishing day presence per vessel. Green = both sources agree; red = CV only; blue = GFW only. Faceted by year."}
+if (!exists("events_classified_fr")) {
+  message("Skipping heatmaps — events_classified_fr not available.")
+} else {
+
+for (vessel_check in all_vessels) {
+
+  mmsi_check <- vessels_cv$mmsi[vessels_cv$vessel == vessel_check]
+  if (length(mmsi_check) == 0 || is.na(mmsi_check)) next
+
+  # CV dates
+  cv_dates_all <- elog %>%
+    filter(vessel == vessel_check) %>%
+    mutate(division = toupper(faozone)) %>%
+    filter(division %in% study_divs) %>%
+    distinct(date) %>%
+    mutate(in_cv = TRUE)
+
+  # GFW dates
+  gfw_dates_all <- events_classified_fr %>%
+    rename_with(~ "ssvid", any_of("vessel_ssvid")) %>%
+    filter(ssvid == mmsi_check,
+           division %in% study_divs) %>%
+    mutate(date = as.Date(start)) %>%
+    distinct(date) %>%
+    mutate(in_gfw = TRUE)
+
+  if (nrow(cv_dates_all) == 0 && nrow(gfw_dates_all) == 0) next
+
+  # Combine
+  date_comparison_all <- full_join(cv_dates_all, gfw_dates_all, by = "date") %>%
+    replace_na(list(in_cv = FALSE, in_gfw = FALSE)) %>%
+    mutate(
+      year   = year(date),
+      month  = month(date, label = TRUE),
+      day    = day(date),
+      status = case_when(
+        in_cv & in_gfw  ~ "Both",
+        in_cv & !in_gfw ~ "CV only",
+        !in_cv & in_gfw ~ "GFW only"
+      )
+    ) %>%
+    filter(!is.na(year), year < 2026)
+
+  if (nrow(date_comparison_all) == 0) next
+
+  # Per-year agreement summary for subtitle
+  year_summary <- date_comparison_all %>%
+    group_by(year) %>%
+    count(status) %>%
+    pivot_wider(names_from = status, values_from = n, values_fill = 0) %>%
+    mutate(
+      Both     = if ("Both"     %in% names(.)) Both     else 0L,
+      CV_only  = if ("CV only"  %in% names(.)) `CV only`  else 0L,
+      GFW_only = if ("GFW only" %in% names(.)) `GFW only` else 0L,
+      total    = Both + CV_only + GFW_only,
+      pct_both = round(Both / total * 100)
+    ) %>%
+    ungroup()
+
+  overall_pct <- round(sum(year_summary$Both) / sum(year_summary$total) * 100)
+  n_cv_days   <- sum(date_comparison_all$in_cv)
+  n_gfw_days  <- sum(date_comparison_all$in_gfw)
+
+  subtitle_text <- paste0(
+    "Green = both agree | Red = CV only | Blue = GFW only",
+    "  |  CV days: ", n_cv_days,
+    "  |  GFW days: ", n_gfw_days,
+    "  |  Overall agreement: ", overall_pct, "%"
+  )
+
+  p <- date_comparison_all %>%
+    ggplot(aes(x = day, y = month, fill = status)) +
+    theme_bw() +
+    geom_tile(colour = "white", linewidth = 0.2) +
+    scale_fill_manual(
+      values = c("Both" = "#59A14F", "CV only" = "#E15759", "GFW only" = "#4E79A7"),
+      drop   = FALSE
+    ) +
+    scale_x_continuous(breaks = c(1, 10, 20, 31)) +
+    facet_wrap(~ year, nrow = 3) +
+    labs(
+      x        = "Day of month",
+      y        = "",
+      fill     = "Source",
+      title    = paste0("Fishing day presence — ", vessel_check,
+                        "  (MMSI: ", mmsi_check, ")"),
+      subtitle = subtitle_text
+    ) +
+    theme(
+      strip.text      = element_text(face = "bold"),
+      panel.spacing   = unit(0.4, "lines"),
+      legend.position = "bottom",
+      plot.title      = element_text(face = "bold", size = 13),
+      plot.subtitle   = element_text(size = 9, colour = "grey40")
+    )
+
+  print(p)
+}
+
+} # end if (exists("events_classified_fr"))
+```
+
+---
+
+# 6. Discrepancy diagnostics
+
+The diagnostics below focus on a subset of vessels and years where discrepancies are largest. Adjust `focus_vessels` and `focus_years` as needed.
+
+```{r diag-settings}
+focus_vessels <- c("SCH65", "SL9")
+focus_years   <- 2017:2020
+```
+
+## 6.1 CV duplicate records
+
+```{r diag1-cv-duplicates}
+# Haul counts per vessel × date × division — reveals any double-counting
+cv_daily_counts <- elog %>%
+  filter(vessel %in% focus_vessels,
+         year(date) %in% focus_years) %>%
+  mutate(division = toupper(fao_division)) %>%
+  group_by(vessel, date, division) %>%
+  summarise(n_records = n(), .groups = "drop")
+
+cv_daily_counts %>%
+  group_by(Vessel = vessel) %>%
+  summarise(
+    `Date-division combos`      = n(),
+    `Combos with 1 record`      = sum(n_records == 1),
+    `Combos with 2+ records`    = sum(n_records > 1),
+    `Max records per day`       = max(n_records),
+    .groups = "drop"
+  ) %>%
+  knitr::kable(caption = "CV haul record counts per vessel-date-division combination.")
+```
+
+```{r diag1-multi-division-dates}
+# Dates appearing in multiple divisions — these add fishing days if not deduped
+elog %>%
+  filter(vessel %in% focus_vessels,
+         year(date) %in% focus_years) %>%
+  mutate(division = toupper(fao_division)) %>%
+  distinct(vessel, date, division) %>%
+  group_by(vessel, date) %>%
+  filter(n() > 1) %>%
+  arrange(vessel, date) %>%
+  knitr::kable(caption = "Dates recorded in multiple ICES divisions (focus vessels and years).")
+```
+
+## 6.2 CV fishing days by division
+
+```{r diag2-cv-by-division}
+elog %>%
+  filter(vessel %in% focus_vessels,
+         year(date) %in% focus_years) %>%
+  mutate(
+    division = toupper(fao_division),
+    year     = year(date),
+    in_study = division %in% study_divs
+  ) %>%
+  distinct(vessel, date, division, year, in_study) %>%
+  group_by(Vessel = vessel, Year = year, `In study divs` = in_study) %>%
+  summarise(`Fishing days` = n(), .groups = "drop") %>%
+  knitr::kable(caption = "CV fishing days inside and outside study divisions (focus vessels).")
+```
+
+## 6.3 GFW AIS gap check
+
+```{r diag3-ais-gaps, fig.cap="Figure 4. Monthly GFW fishing event counts for focus vessels. Red bars indicate months with no events recorded (potential AIS gaps)."}
+# Requires events_classified_fr (or events_df) in environment
+if (!exists("events_classified_fr") && !exists("events_df")) {
+  message("Skipping AIS gap check — neither events_classified_fr nor events_df found.")
+} else {
+
+gfw_event_source <- if (exists("events_df")) "events_df" else "events_classified_fr"
+
+gfw_events_focus <- get(gfw_event_source) %>%
+  rename_with(~ "ssvid", any_of("vessel_ssvid")) %>%
+  filter(ssvid %in% vessels_cv$mmsi[vessels_cv$vessel %in% focus_vessels]) %>%
+  left_join(vessels_cv %>% dplyr::select(mmsi, vessel),
+            by = c("ssvid" = "mmsi"))
+
+monthly_gfw <- gfw_events_focus %>%
+  mutate(year  = year(as.Date(start)),
+         month = month(as.Date(start))) %>%
+  filter(year %in% focus_years) %>%
+  group_by(vessel, year, month) %>%
+  summarise(n_events = n(), .groups = "drop")
+
+# Complete grid so missing months appear as zero
+monthly_gfw_complete <- crossing(
+  vessel = focus_vessels,
+  year   = focus_years,
+  month  = 1:12
+) %>%
+  left_join(monthly_gfw, by = c("vessel", "year", "month")) %>%
+  replace_na(list(n_events = 0)) %>%
+  mutate(date = as.Date(paste(year, month, "01", sep = "-")))
+
+monthly_gfw_complete %>%
+  ggplot(aes(x = date, y = n_events)) +
+  theme_bw() +
+  geom_col(aes(fill = n_events == 0), width = 25) +
+  scale_fill_manual(
+    values = c("FALSE" = "#4E79A7", "TRUE" = "#E15759"),
+    labels = c("FALSE" = "Events recorded", "TRUE" = "No events (gap)"),
+    name   = ""
+  ) +
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5)) +
+  labs(x = "", y = "GFW fishing events per month",
+       title = "GFW monthly event counts — AIS gap detection",
+       subtitle = "Red bars = months with zero fishing events recorded by GFW") +
+  facet_wrap(~ vessel, ncol = 1)
+
+} # end if (exists("events_classified_fr") || exists("events_df"))
+```
+
+## 6.4 Date-level comparison for a single vessel × year
+
+```{r diag5-date-level, fig.cap="Figure 5. Calendar heatmap showing the date-level agreement between GFW and CV logbook for the focus vessel and year. Green = both; red = CV only; blue = GFW only."}
+if (!exists("events_classified_fr")) {
+  message("Skipping date-level comparison — events_classified_fr not available.")
+} else {
+
+vessel_check <- focus_vessels[1]
+year_check   <- focus_years[1]
+
+mmsi_check <- vessels_cv$mmsi[vessels_cv$vessel == vessel_check]
+
+cv_dates <- elog %>%
+  filter(vessel == vessel_check, year(date) == year_check) %>%
+  mutate(division = toupper(fao_division)) %>%
+  filter(division %in% study_divs) %>%
+  distinct(date, division) %>%
+  mutate(in_cv = TRUE)
+
+gfw_dates <- events_classified_fr %>%
+  rename_with(~ "ssvid", any_of("vessel_ssvid")) %>%
+  filter(ssvid == mmsi_check,
+         year(as.Date(start)) == year_check,
+         division %in% study_divs) %>%
+  mutate(date = as.Date(start)) %>%
+  distinct(date, division) %>%
+  mutate(in_gfw = TRUE)
+
+date_comparison <- full_join(cv_dates, gfw_dates, by = c("date", "division")) %>%
+  replace_na(list(in_cv = FALSE, in_gfw = FALSE)) %>%
+  mutate(
+    status = case_when(
+      in_cv & in_gfw  ~ "Both",
+      in_cv & !in_gfw ~ "CV only",
+      !in_cv & in_gfw ~ "GFW only"
+    )
+  ) %>%
+  arrange(division, date)
+
+date_comparison %>%
+  mutate(month = month(date, label = TRUE),
+         day   = day(date)) %>%
+  ggplot(aes(x = day, y = month, fill = status)) +
+  theme_bw() +
+  geom_tile(colour = "white", linewidth = 0.3) +
+  scale_fill_manual(values = c(
+    "Both"     = "#59A14F",
+    "CV only"  = "#E15759",
+    "GFW only" = "#4E79A7"
+  )) +
+  labs(x = "Day of month", y = "", fill = "Source",
+       title = paste0("Fishing day presence — ", vessel_check, " ", year_check),
+       subtitle = "Green = both agree | Red = CV only (AIS gap?) | Blue = GFW only") +
+  facet_wrap(~ division)
+
+} # end if (exists("events_classified_fr"))
+```
+
+---
+
+# 7. Interpretation
+
+## 7.1 What discrepancies may indicate
+
+**CV only (red cells)** — possible causes:
+
+- AIS transponder switched off or malfunctioning on that day.
+- GFW classifier missed the fishing activity (e.g. slow steaming gear).
+- Vessel fished in an area with poor satellite AIS coverage.
+- Logbook records a day as fishing that GFW does not classify as such.
+
+**GFW only (blue cells)** — possible causes:
+
+- Fishing activity recorded by AIS but not submitted in the logbook.
+- GFW classifier false positive (vessel steaming classified as fishing).
+- Logbook records the trip under a different division or date.
+- Vessel was active but the trip was not yet processed in the CV data.
+
+Systematic patterns — for example, consistently red in a particular year or season — are more informative than isolated mismatches. A high proportion of green cells indicates good agreement between the two data sources.
+
+## 7.2 Majority-rule deduplication
+
+The CV fishing day count uses a majority-rule procedure to assign each vessel-date to a single ICES division (the one with the most hauls). This avoids inflating the CV day count when a vessel's logbook records hauls in two divisions on the same day. The same logic underlies the GFW pipeline aggregation, making the two metrics directly comparable.
+
+---
+
+# 8. Saved outputs
+
+```{r save-outputs}
+# Save comparison tables as RData
+save(fishing_days_gfw_cv_long, fishing_days_wide,
+     file = file.path(flyshootdata, "gfw_vs_cv_comparison.RData"))
+message("Saved: gfw_vs_cv_comparison.RData")
+
+# Excel export
+writexl::write_xlsx(
+  list(
+    "GFW vs CV (wide)"      = fishing_days_wide,
+    "GFW vs CV (long)"      = fishing_days_gfw_cv_long,
+    "GFW days (CV vessels)" = fishing_days_gfw_cv %>%
+      group_by(vessel, ssvid, vessel_flag, gear, gt,
+               size_class, division, year) %>%
+      summarise(fishing_days = sum(fishing_days), .groups = "drop"),
+    "CV days"               = fishing_days_cv %>%
+      group_by(vessel, division, year) %>%
+      summarise(fishing_days = sum(fishing_days), .groups = "drop"),
+    "CV vessel info"        = vessels_cv
+  ),
+  path = file.path(flyshootdata,
+                   paste0("GFW_vs_CV_comparison_", Sys.Date(), ".xlsx"))
+)
+message("Saved: GFW_vs_CV_comparison_", Sys.Date(), ".xlsx")
+```
+
+---
+
+# Annex A — Data sources
+
+| Dataset | Source | Period | Role in this analysis |
+|---|---|---|---|
+| GFW effort (Stage 7) | GFW AIS pipeline | 2013–2025 | Fishing days per vessel × division × year |
+| GFW events | GFW API / AIS pipeline | 2013–2025 | Day-level comparison and AIS gap diagnostics |
+| CV electronic logbook | CV vessel operators | 2013–2025 | Independent effort metric from haul records |
+| CV vessel info | CV fleet register | — | MMSI lookup, vessel metadata |
+
+Study area: ICES divisions `r paste(study_divs, collapse = ", ")`.
+
+---
+
+# Annex B — Technical notes
+
+- **Effort metric**: unique fishing days per vessel × year × ICES division (one calendar date = one fishing day regardless of number of hauls or trips).
+- **Majority rule**: where a vessel-date appears in multiple ICES divisions in the logbook, the division with the most hauls is retained. This prevents double-counting and matches the GFW aggregation approach.
+- **Agreement threshold**: ±5 days absolute difference is used as the agreement criterion for annual comparisons (Section 4.1).
+- **Calendar heatmaps**: based on date-only matching (not date × division), consistent with the approach used in the multi-year vessel PDF export.
+- **Source scripts**: `GFW_vs_CV_effort_comparison_v1.R` (main analysis), `Extract_GFW_effort_v7.R` (GFW pipeline).

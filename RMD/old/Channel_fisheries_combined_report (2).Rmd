@@ -1,0 +1,1302 @@
+---
+title: "Fishing in the English Channel: Trends in Fishing Effort, Ecosystem Impacts and Sustainability"
+subtitle: "A combined analysis using STECF AER, GFW and STECF FDI data (2008–2025)"
+author: "Martin Pastoors"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+client: "Vrolijk"
+output:
+  word_document:
+    reference_docx: "../report_template.dotx"
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 8,
+  fig.height = 5,
+  dpi        = 150
+)
+```
+
+<!-- =========================================================
+     LIBRARIES
+     ========================================================= -->
+
+```{r libraries}
+# Core
+library(tidyverse)
+library(lubridate)
+library(readxl)
+library(janitor)
+library(patchwork)    # combine panels for AER vs GFW comparison
+
+# Spatial (GFW section)
+library(sf)
+library(spatstat)
+library(rnaturalearth)
+library(rnaturalearthdata)
+
+# Concentration metrics (GFW section)
+library(ineq)
+```
+
+<!-- =========================================================
+     SETTINGS — edit paths here
+     ========================================================= -->
+
+```{r settings}
+# ---- Directory paths --------------------------------------------------------
+spatialdir  <- "C:/Users/MartinPastoors/OneDrive - Martin Pastoors/DATA/RDATA"
+flyshootdir <- "C:/Users/MartinPastoors/Martin Pastoors/FLYSHOOT - General/data"
+aer_file    <- "C:/Users/MartinPastoors/Martin Pastoors/MPFF - General/PROJECTS/FLYSHOOT/STECF 2025-07_AER_data/STECF_25 07_EU Fleet Economic and Transversal data_fleet segment level.xlsx"
+fdi_dir     <- "C:/Users/MartinPastoors/Martin Pastoors/MPFF - General/PROJECTS/FLYSHOOT/stecf 2025_Effort-landings-catches-capacity-biological"
+out_dir     <- "C:/Users/MartinPastoors/Martin Pastoors/MPFF - General/PROJECTS/FLYSHOOT/output"
+cache_dir   <- file.path(out_dir, "cache")
+
+if (!dir.exists(out_dir))   dir.create(out_dir,   recursive = TRUE)
+if (!dir.exists(cache_dir)) dir.create(cache_dir, recursive = TRUE)
+
+# ---- Cache file paths -------------------------------------------------------
+aer_cache     <- file.path(cache_dir, "cache_aer.RData")
+gfw_cache     <- file.path(cache_dir, "cache_gfw.RData")
+fdi_cache     <- file.path(cache_dir, "cache_fdi.RData")
+spatial_cache <- file.path(cache_dir, "cache_gfw_spatial.RData")
+  # spatial_cache stores all heavy computed spatial objects:
+  #   land_study, study_window_proj, study_owin, world_proj, fao_div_proj,
+  #   kde_results (all-area KDE), kde_7d (7D KDE),
+  #   cell_effort_7d, concentration_7d, cell_effort_full
+
+# ---- Study parameters -------------------------------------------------------
+study_years     <- 2013:2025
+aer_years_start <- 2008
+study_divisions_gfw <- c("27.4.C", "27.7.D", "27.7.E")
+study_divisions_aer <- c("27.7.d", "27.7.e", "27.4.c")
+study_divisions_fdi <- c("4.C", "7.D", "7.E")
+
+threshold_pct <- 1
+xlim <- c(-7, 8)
+ylim <- c(48, 54)
+
+# ---- Colour palettes --------------------------------------------------------
+flag_colours <- c(
+  "BEL"   = "#4E79A7",
+  "NLD"   = "#F28E2B",
+  "GBR"   = "#59A14F",
+  "FRA"   = "#E15759",
+  "DEU"   = "#76B7B2",
+  "Other" = "#BAB0AC"
+)
+
+size_colours <- c(
+  "S1 <100 GT"     = "#1D9E75",
+  "S2 100-300 GT"  = "#BA7517",
+  "S3 300-600 GT"  = "#7F77DD",
+  "S4 600-1200 GT" = "#D85A30",
+  "S5 >1200 GT"    = "#A32D2D"
+)
+
+# ---- KW-to-GT conversion ----------------------------------------------------
+# Approximate fleet-average ratio used when one metric is missing.
+# Derived from AER fleet segments that report both; update if better data become
+# available. Ratio defined as GT per kW (median across vessel-length classes).
+# NOTE: this is a fleet-level approximation only — individual vessel ratios vary
+# considerably. Applied only where totgtfishdays is NA and totkwfishdays > 0.
+kw_to_gt_ratio <- 0.55   # GT = kW * kw_to_gt_ratio (fleet average)
+```
+
+<!-- =========================================================
+     HELPER FUNCTIONS
+     ========================================================= -->
+
+```{r helpers-gfw}
+load_object <- function(filepath, object_name) {
+  local({
+    e <- new.env()
+    load(filepath, envir = e)
+    e[[object_name]]
+  })
+}
+
+apply_flag_other <- function(df, flag_col = "vessel_flag",
+                              days_col = "fishing_days") {
+  df %>%
+    group_by(across(all_of(flag_col))) %>%
+    mutate(total_flag_days = sum(.data[[days_col]])) %>%
+    ungroup() %>%
+    mutate(
+      total_days = sum(.data[[days_col]]),
+      flag_pct   = total_flag_days / total_days * 100,
+      across(all_of(flag_col),
+             ~ if_else(flag_pct < threshold_pct, "Other", .x))
+    )
+}
+```
+
+```{r helpers-aer}
+map_gear_aer <- function(x) {
+  dplyr::recode(str_to_upper(str_trim(x)),
+    DTS = "Bottom trawl/seine", TBB = "Beam trawl",
+    PEL = "Midwater trawl",     DFN = "Gillnet",
+    HOK = "Handline/rod",       FPO = "Pot/trap",
+    DRB = "Dredge",             PS  = "Purse seine",
+    LL  = "Longline",
+    .default = "Other/mixed"
+  )
+}
+
+# Species group lookup — used in multiple landings plots
+assign_species_group <- function(species_code, species_name) {
+  sn <- tolower(species_name)
+  case_when(
+    str_detect(sn, "cuttlefish|sepia") |
+      species_code %in% c("CTC","CTL","CTZ","CTB","CTS","SEB","OCC")
+      ~ "Cuttlefish",
+    str_detect(sn, "squid|loligo|bobtail|ommastrep|shortfin") |
+      species_code %in% c("SQC","SQR","SQE","SQM","LOL","LOG","SQS","SQZ",
+                           "SQX","EUR","BOC","SQI","OMS","TOD","NBS","OMP","ILL")
+      ~ "Squid",
+    str_detect(sn, "mullet") |
+      species_code %in% c("MUL","MUG","TFM","MUT","MUX")
+      ~ "Mullets",
+    str_detect(sn, "gurnard|searobin") |
+      species_code %in% c("GUG","GUR","GUU","GUX","TUB","BIR")
+      ~ "Gurnards",
+    str_detect(sn, "^mackerel") |
+      species_code %in% c("MAC","MAS")
+      ~ "Mackerel",
+    str_detect(sn, "horse mackerel|scad") |
+      species_code %in% c("HOM","HMM","JAA","JAX")
+      ~ "Horse mackerel",
+    str_detect(sn, "whiting") |
+      species_code %in% c("WHG")
+      ~ "Whiting",
+    str_detect(sn, "scallop|pecten") |
+      species_code %in% c("SCE","QSC","PEC","SCA","SCB")
+      ~ "Scallops",
+    str_detect(sn, "whelk|buccinidae|buccinum") |
+      species_code %in% c("WHE","BUC")
+      ~ "Whelk",
+    TRUE ~ NA_character_
+  )
+}
+
+# Ordered factor levels for species groups
+species_group_levels <- c("Cuttlefish","Squid","Mullets","Gurnards",
+                           "Mackerel","Horse mackerel","Whiting","Scallops","Whelk")
+
+# Gear categories primarily catching Channel species of interest
+# (used in the focused gear × species plot)
+focal_gears <- c("Bottom trawl/seine", "Beam trawl", "Dredge",
+                 "Pot/trap", "Gillnet")
+```
+
+```{r helpers-fdi}
+safe_numeric <- function(x, extra_sentinels = character(0)) {
+  base_pat <- "NK|na|N/A|#N/A|CONFID|confidential|BEL|\\."
+  full_pat  <- if (length(extra_sentinels) > 0)
+    paste0("^(", base_pat, "|", paste(extra_sentinels, collapse = "|"), ")$")
+  else
+    paste0("^(", base_pat, ")$")
+  cleaned <- str_trim(x) |>
+    str_replace_all(regex(full_pat, ignore_case = TRUE), NA_character_)
+  val <- suppressWarnings(as.numeric(cleaned))
+  val[!is.na(val) & val == -1] <- NA_real_
+  val
+}
+
+normalise_division <- function(x) {
+  x <- str_trim(x) |> str_to_upper()
+  x <- str_remove(x, "^27\\.")
+  str_replace(x, "^(\\d+)([A-Z])$", "\\1.\\2")
+}
+
+map_gear_fdi <- function(gear_code) {
+  lookup <- c(
+    OTB="Bottom trawl", OTT="Bottom trawl", PTB="Bottom trawl",
+    OTM="Midwater trawl", PTM="Midwater trawl",
+    TBB="Beam trawl",
+    SSC="Scottish seine", SDN="Danish seine",
+    GNS="Gillnet", GND="Gillnet",
+    FPN="Pot/trap", FPO="Pot/trap",
+    LLS="Longline", LLD="Longline",
+    DRB="Dredge",
+    MIS="Other/mixed", NK="Unknown"
+  )
+  dplyr::recode(str_to_upper(str_trim(gear_code)),
+                !!!lookup, .default = "Other/mixed")
+}
+```
+
+<!-- =========================================================
+     DATA LOADING — with cache logic
+     ========================================================= -->
+
+```{r load-aer}
+# Cache: cache_aer.RData — aer_effort_summary, aer_effort_capacity_metric,
+#                           aer_landings_summary
+#
+# Cache is invalidated when:
+#   (a) the raw AER Excel file is newer than the cache, OR
+#   (b) the cache exists but does not contain aer_effort_capacity_metric
+#       (handles the case where the cache was built before that object was added)
+
+aer_raw_mtime   <- file.mtime(aer_file)
+aer_cache_mtime <- if (file.exists(aer_cache)) file.mtime(aer_cache) else as.POSIXct(0)
+
+# Check (b): peek at object names in an existing cache without fully loading it
+aer_cache_has_capacity <- if (file.exists(aer_cache)) {
+  "aer_effort_capacity_metric" %in% load(aer_cache, envir = new.env())
+} else {
+  FALSE
+}
+
+if (aer_cache_mtime > aer_raw_mtime && aer_cache_has_capacity) {
+
+  message("AER: loading from cache (", format(aer_cache_mtime, "%Y-%m-%d %H:%M"), ")")
+  load(aer_cache)
+
+} else {
+
+  if (!aer_cache_has_capacity)
+    message("AER: cache missing aer_effort_capacity_metric — rebuilding ...")
+  else
+    message("AER: cache stale — reading raw Excel file ...")
+
+  aer_effort_sheet <- read_excel(aer_file, sheet = "FS_effort by sub-region ") |>
+    clean_names()
+  message("AER effort sheet: ", nrow(aer_effort_sheet), " rows, ",
+          ncol(aer_effort_sheet), " columns")
+  message("  variable_code values: ",
+          paste(sort(unique(aer_effort_sheet$variable_code)), collapse=", "))
+  message("  sub_reg values (sample): ",
+          paste(head(sort(unique(aer_effort_sheet$sub_reg)), 20), collapse=", "))
+
+  aer_effort_raw <- aer_effort_sheet |>
+    filter(!is.na(variable_code), !is.na(value)) |>
+    mutate(
+      year          = as.integer(year),
+      sub_reg       = str_to_lower(str_trim(sub_reg)),
+      gear_category = map_gear_aer(fishing_tech)
+    ) |>
+    # Filter to study area BEFORE pivot to reduce size
+    filter(sub_reg %in% study_divisions_aer) |>
+    # NOTE: fs_name is intentionally excluded from the pivot keys.
+    # It is a free-text fleet segment label that can differ across rows of the
+    # same stratum, which would create spurious extra rows if included.
+    # year + country_code + sub_reg + fishing_tech + vessel_length + gear_category
+    # form the natural stratum key; values_fn = sum handles any remaining
+    # duplicates within a stratum × variable_code combination.
+    select(year, country_code, sub_reg, fishing_tech,
+           vessel_length, gear_category,
+           variable_code, value) |>
+    pivot_wider(names_from = variable_code, values_from = value,
+                values_fn = sum)
+  
+  t1 <-
+    aer_effort_raw <- aer_effort_sheet |>
+    filter(!is.na(variable_code), !is.na(value)) |>
+    mutate(
+      year          = as.integer(year),
+      sub_reg       = str_to_lower(str_trim(sub_reg)),
+      gear_category = map_gear_aer(fishing_tech)
+    ) |>
+    filter(sub_reg %in% study_divisions_aer) |>
+    filter(year == 2023) %>% 
+    select(year, country_code, sub_reg, fishing_tech,
+           vessel_length, gear_category,
+           variable_code, value) 
+  writexl::write_xlsx(t1, path=file.path(cache_dir, "t1.xlsx"))
+  
+  t2 <-
+    aer_effort_raw <- aer_effort_sheet |>
+    filter(!is.na(variable_code), !is.na(value)) |>
+    mutate(
+      year          = as.integer(year),
+      sub_reg       = str_to_lower(str_trim(sub_reg)),
+      gear_category = map_gear_aer(fishing_tech)
+    ) |>
+    filter(sub_reg %in% study_divisions_aer) |>
+    filter(year == 2023) %>% 
+    select(year, country_code, sub_reg, fishing_tech,
+           vessel_length, gear_category,
+           variable_code, value) |>
+    pivot_wider(names_from = variable_code, values_from = value,
+                values_fn = sum)
+  writexl::write_xlsx(t2, path=file.path(cache_dir, "t2.xlsx"))
+  
+  message("AER effort after pivot (study area): ", nrow(aer_effort_raw), " rows")
+  message("  Columns: ", paste(names(aer_effort_raw), collapse=", "))
+  message("  Countries: ", paste(sort(unique(aer_effort_raw$country_code)), collapse=", "))
+  message("  Year range: ", min(aer_effort_raw$year), "–", max(aer_effort_raw$year))
+
+  aer_landings_sheets <- bind_rows(
+    read_excel(aer_file, sheet = "FS_landings FAO 2008-2012") |> clean_names(),
+    read_excel(aer_file, sheet = "FS_landings FAO 2013-2017") |> clean_names(),
+    read_excel(aer_file, sheet = "FS_landings FAO 2018-2023") |> clean_names()
+  )
+  message("AER landings sheets combined: ", nrow(aer_landings_sheets), " rows")
+
+  aer_landings_raw <- aer_landings_sheets |>
+    filter(!is.na(variable_code), !is.na(value)) |>
+    mutate(
+      year          = as.integer(year),
+      sub_reg       = str_to_lower(str_trim(sub_reg)),
+      gear_category = map_gear_aer(fishing_tech)
+    ) |>
+    # Filter to study area BEFORE pivot
+    filter(sub_reg %in% study_divisions_aer) |>
+    select(year, country_code, sub_reg, fishing_tech,
+           vessel_length, gear_category,
+           species_code, species_name,
+           variable_code, value) |>
+    pivot_wider(names_from = variable_code, values_from = value,
+                values_fn = sum) |>
+    rename(live_weight_kg = totwghtlandg,
+           value_euro     = totvallandg) |>
+    mutate(live_weight_t = live_weight_kg / 1000)
+
+  message("AER landings after pivot (study area): ", nrow(aer_landings_raw), " rows")
+  message("  Countries: ", paste(sort(unique(aer_landings_raw$country_code)), collapse=", "))
+
+  # Basic fishing-days summary
+  aer_effort_summary <- aer_effort_raw |>
+    group_by(year, country_code, gear_category, sub_reg) |>
+    summarise(
+      across(any_of(c("totfishdays","totseadays","totkwfishdays","totgtfishdays")),
+             ~ sum(.x, na.rm = TRUE)),
+      .groups = "drop"
+    )
+
+  # Capacity-weighted effort: GT-fishing days where available; impute from
+  # kW-fishing days for countries that only report kW (using fleet-average ratio).
+  # A flag column records the source so plots can distinguish imputed values.
+  aer_effort_capacity_metric <- aer_effort_summary |>
+    mutate(
+      gt_fishdays_source = case_when(
+        totgtfishdays > 0             ~ "GT (reported)",
+        totkwfishdays > 0             ~ "GT (imputed from kW)",
+        TRUE                          ~ "Not available"
+      ),
+      gt_fishdays_harmonised = case_when(
+        totgtfishdays > 0             ~ totgtfishdays,
+        totkwfishdays > 0             ~ totkwfishdays * kw_to_gt_ratio,
+        TRUE                          ~ NA_real_
+      )
+    )
+
+  aer_landings_summary <- aer_landings_raw |>
+    group_by(year, country_code, gear_category,
+             sub_reg, species_code, species_name) |>
+    summarise(
+      live_weight_t = sum(live_weight_t, na.rm = TRUE),
+      value_euro    = sum(value_euro,    na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  save(aer_effort_summary, aer_effort_capacity_metric, aer_landings_summary,
+       file = aer_cache)
+  message("AER: cache saved → ", aer_cache)
+}
+```
+
+```{r load-gfw}
+# Cache: cache_gfw.RData — fishing_days_study, events_classified_fr,
+#                           vessel_meta, fao_sf_division, world
+
+gfw_source_files <- c(
+  file.path(flyshootdir, "gfw_s7_effort.RData"),
+  file.path(flyshootdir, "gfw_s6_zones.RData"),
+  file.path(flyshootdir, "gfw_s3_vessel_meta.RData")
+)
+gfw_raw_mtime   <- max(file.mtime(gfw_source_files), na.rm = TRUE)
+gfw_cache_mtime <- if (file.exists(gfw_cache)) file.mtime(gfw_cache) else as.POSIXct(0)
+
+if (gfw_cache_mtime > gfw_raw_mtime) {
+
+  message("GFW: loading from cache (", format(gfw_cache_mtime, "%Y-%m-%d %H:%M"), ")")
+  load(gfw_cache)
+
+} else {
+
+  message("GFW: cache missing or stale — loading pipeline RData files ...")
+
+  fishing_days_study   <- load_object(
+    file.path(flyshootdir, "gfw_s7_effort.RData"), "fishing_days_study")
+  events_classified_fr <- load_object(
+    file.path(flyshootdir, "gfw_s6_zones.RData"), "events_classified_fr")
+  vessel_meta          <- load_object(
+    file.path(flyshootdir, "gfw_s3_vessel_meta.RData"), "vessel_meta")
+
+  world <- ne_countries(scale = "medium", returnclass = "sf")
+
+  fao_sf <- load_object(file.path(spatialdir, "fao_sf.RData"), "fao_sf")
+  fao_sf_division <- fao_sf |>
+    filter(F_LEVEL == "DIVISION") |>
+    dplyr::select(division = F_DIVISION) |>
+    mutate(division = toupper(division)) |>
+    filter(division %in% study_divisions_gfw) |>
+    group_by(division) |>
+    summarise(geometry = st_union(geometry)) |>
+    st_make_valid()
+  rm(fao_sf)
+
+  save(fishing_days_study, events_classified_fr, vessel_meta,
+       fao_sf_division, world,
+       file = gfw_cache)
+  message("GFW: cache saved → ", gfw_cache)
+}
+```
+
+```{r load-gfw-spatial}
+# Cache: cache_gfw_spatial.RData
+# Stores all expensive computed spatial objects so they survive across knits.
+# Objects saved:
+#   land_study, study_window_proj, study_owin,
+#   world_proj, fao_div_proj,
+#   bbox_7d_proj, window_7d_proj, window_7d_owin,
+#   kde_results      (all-area KDE, all years)
+#   kde_7d           (7D KDE, all years)
+#   cell_effort_7d   (events per 5 km cell per year, 7D)
+#   cell_effort_full (full grid with zeros, 7D)
+#   concentration_7d (Gini + top10 per year, 7D)
+#
+# To force recomputation (e.g. after new GFW data):
+#   file.remove(spatial_cache)
+
+crs_proj    <- 32630
+sigma_all   <- 20000   # KDE bandwidth for all-area map (m)
+sigma_7d    <- 10000   # KDE bandwidth for 7D map (m)
+kde_sample  <- 10000   # events sampled per year for KDE
+cell_size   <- 5000    # grid cell size for concentration (m)
+
+spatial_cache_mtime <- if (file.exists(spatial_cache)) file.mtime(spatial_cache) else as.POSIXct(0)
+gfw_cache_mtime_now <- file.mtime(gfw_cache)   # spatial depends on gfw objects
+
+if (spatial_cache_mtime > gfw_cache_mtime_now) {
+
+  message("GFW spatial: loading from cache (", format(spatial_cache_mtime, "%Y-%m-%d %H:%M"), ")")
+  load(spatial_cache)
+
+} else {
+
+  message("GFW spatial: computing spatial objects (this takes a few minutes) ...")
+
+  # ---- Base spatial objects ------------------------------------------------
+  land_study <- world %>%
+    st_crop(st_bbox(c(xmin = xlim[1], xmax = xlim[2],
+                      ymin = ylim[1], ymax = ylim[2]), crs = 4326)) %>%
+    st_union()
+
+  study_window_sf <- fao_sf_division %>%
+    st_union() %>%
+    st_difference(land_study) %>%
+    st_make_valid()
+
+  study_window_proj <- study_window_sf %>% st_transform(crs_proj)
+  study_owin        <- as.owin(study_window_proj)
+  world_proj        <- world           %>% st_transform(crs_proj)
+  fao_div_proj      <- fao_sf_division %>% st_transform(crs_proj)
+
+  # ---- 7D spatial objects --------------------------------------------------
+  bbox_7d <- st_bbox(fao_sf_division %>% filter(division == "27.7.D"))
+  land_7d <- world %>% st_crop(bbox_7d) %>% st_union()
+  window_7d_sf <- fao_sf_division %>%
+    filter(division == "27.7.D") %>%
+    st_difference(land_7d) %>%
+    st_make_valid()
+  window_7d_proj <- window_7d_sf %>% st_transform(crs_proj)
+  window_7d_owin <- as.owin(window_7d_proj)
+  bbox_7d_proj   <- st_bbox(window_7d_proj)
+
+  # ---- KDE — all divisions -------------------------------------------------
+  events_for_kde_proj <- events_classified_fr %>%
+    mutate(year = lubridate::year(start)) %>%
+    filter(year %in% study_years, !is.na(lon), !is.na(lat)) %>%
+    dplyr::select(year, lon, lat) %>%
+    group_by(year) %>%
+    slice_sample(n = kde_sample) %>%
+    ungroup() %>%
+    st_as_sf(coords = c("lon","lat"), crs = 4326) %>%
+    st_transform(crs_proj) %>%
+    mutate(x = st_coordinates(.)[,1], y = st_coordinates(.)[,2]) %>%
+    st_drop_geometry()
+
+  kde_results <- map_dfr(study_years, function(yr) {
+    pts <- events_for_kde_proj %>% filter(year == yr)
+    if (nrow(pts) < 50) return(NULL)
+    ppp_yr <- tryCatch(
+      ppp(x = pts$x, y = pts$y, window = study_owin),
+      error = function(e) NULL)
+    if (is.null(ppp_yr)) return(NULL)
+    kde <- density(ppp_yr, sigma = sigma_all, dimyx = c(200,200), edge = TRUE)
+    as.data.frame(kde) %>%
+      rename(x=x, y=y, density=value) %>%
+      filter(!is.na(density), density > 0) %>%
+      mutate(ndensity = density / max(density), year = yr)
+  })
+
+  # ---- KDE — ICES 27.7.D --------------------------------------------------
+  events_7d_proj <- events_classified_fr %>%
+    mutate(year = lubridate::year(start)) %>%
+    filter(year %in% study_years, division == "27.7.D",
+           !is.na(lon), !is.na(lat)) %>%
+    dplyr::select(year, lon, lat) %>%
+    st_as_sf(coords = c("lon","lat"), crs = 4326) %>%
+    st_transform(crs_proj) %>%
+    mutate(x = st_coordinates(.)[,1], y = st_coordinates(.)[,2]) %>%
+    st_drop_geometry()
+
+  kde_7d <- map_dfr(study_years, function(yr) {
+    pts <- events_7d_proj %>% filter(year == yr)
+    if (nrow(pts) < 50) return(NULL)
+    ppp_yr <- tryCatch(
+      ppp(x = pts$x, y = pts$y, window = window_7d_owin),
+      error = function(e) NULL)
+    if (is.null(ppp_yr)) return(NULL)
+    kde <- density(ppp_yr, sigma = sigma_7d, dimyx = c(200,200), edge = TRUE)
+    as.data.frame(kde) %>%
+      rename(x=x, y=y, density=value) %>%
+      filter(!is.na(density), density > 0) %>%
+      mutate(ndensity = density / max(density), year = yr)
+  })
+
+  # ---- Grid-cell effort — ICES 27.7.D ------------------------------------
+  events_7d_grid <- events_7d_proj %>%
+    mutate(
+      x_cell  = floor(x / cell_size) * cell_size + cell_size / 2,
+      y_cell  = floor(y / cell_size) * cell_size + cell_size / 2,
+      cell_id = paste(x_cell, y_cell, sep = "_"))
+
+  cell_effort_7d <- events_7d_grid %>%
+    group_by(year, cell_id, x_cell, y_cell) %>%
+    summarise(n_events = n(), .groups = "drop")
+
+  # Full grid (including zero-effort cells) for hotspot maps
+  x_range <- seq(floor(min(cell_effort_7d$x_cell)/cell_size)*cell_size,
+                 ceiling(max(cell_effort_7d$x_cell)/cell_size)*cell_size, by=cell_size)
+  y_range <- seq(floor(min(cell_effort_7d$y_cell)/cell_size)*cell_size,
+                 ceiling(max(cell_effort_7d$y_cell)/cell_size)*cell_size, by=cell_size)
+
+  full_grid_sf <- expand_grid(year=study_years, x_cell=x_range, y_cell=y_range) %>%
+    st_as_sf(coords=c("x_cell","y_cell"), crs=crs_proj, remove=FALSE) %>%
+    st_filter(window_7d_proj %>% st_buffer(cell_size/2)) %>%
+    st_drop_geometry()
+
+  cell_effort_full <- full_grid_sf %>%
+    left_join(cell_effort_7d %>% dplyr::select(year,x_cell,y_cell,n_events),
+              by=c("year","x_cell","y_cell")) %>%
+    replace_na(list(n_events=0)) %>%
+    group_by(year) %>%
+    mutate(ndensity = n_events / max(n_events)) %>%
+    ungroup()
+
+  # ---- Concentration metrics -----------------------------------------------
+  concentration_7d <- cell_effort_7d %>%
+    group_by(year) %>%
+    summarise(
+      n_cells      = n(),
+      total_events = sum(n_events),
+      gini         = ineq::Gini(n_events),
+      top10_pct    = {
+        s     <- sort(n_events, decreasing=TRUE)
+        n_top <- max(1L, ceiling(0.10*length(s)))
+        sum(s[seq_len(n_top)]) / sum(s) * 100
+      },
+      .groups = "drop")
+
+  save(land_study, study_window_proj, study_owin,
+       world_proj, fao_div_proj,
+       bbox_7d_proj, window_7d_proj, window_7d_owin,
+       kde_results, kde_7d,
+       cell_effort_7d, cell_effort_full, concentration_7d,
+       file = spatial_cache)
+  message("GFW spatial: cache saved → ", spatial_cache)
+}
+```
+
+```{r load-fdi, eval=FALSE}
+# FDI: reference only — set eval=TRUE for QA / cross-validation
+# Cache: cache_fdi.RData — fdi_days, fdi_catches
+
+fdi_source_files <- c(
+  file.path(out_dir, "fdi_fishingdays_by_country_sizeclass_gear_division_year.csv"),
+  file.path(out_dir, "fdi_catches_by_country_sizeclass_gear_division_year.csv")
+)
+fdi_raw_mtime   <- max(file.mtime(fdi_source_files), na.rm=TRUE)
+fdi_cache_mtime <- if (file.exists(fdi_cache)) file.mtime(fdi_cache) else as.POSIXct(0)
+
+if (fdi_cache_mtime > fdi_raw_mtime) {
+  message("FDI: loading from cache")
+  load(fdi_cache)
+} else {
+  message("FDI: reading CSV summaries ...")
+  fdi_days    <- readr::read_csv(fdi_source_files[1], show_col_types=FALSE)
+  fdi_catches <- readr::read_csv(fdi_source_files[2], show_col_types=FALSE)
+  save(fdi_days, fdi_catches, file=fdi_cache)
+  message("FDI: cache saved → ", fdi_cache)
+}
+```
+
+<!-- =========================================================
+     DOCUMENT BODY
+     ========================================================= -->
+
+---
+
+# 1. Summary
+
+*[To be written after finalisation of all chapters.]*
+
+Key points to address:
+
+- Trends in total fishing effort in ICES 4.c/7.d/7.e (2008–present) from STECF AER data.
+- Spatial patterns and concentration of effort from GFW data (2013–present).
+- Position of the Vrolijk flyshoot fleet relative to total fleet activity.
+- Stock status, MSC certification and current management concerns.
+- Compliance with the 2024 gentlemen's agreement.
+- Evidence-based sustainability position and key messages.
+
+---
+
+# 2. Introduction
+
+## 2.1 Background
+
+The flyshoot (Danish seine) fishery has come under increasing public and media scrutiny in recent years, including critical coverage in the Netherlands (e.g. Follow the Money). At the same time, 2024 saw a new multilateral gentlemen's agreement on flyshoot fishing in the eastern Channel, and the scallop fishery in the same area received MSC certification. This study brings together available quantitative data and scientific knowledge to provide an objective, evidence-based assessment of the sustainability position of the flyshoot fleet operating in the Channel.
+
+This report was commissioned by Vrolijk and builds directly on the methodology developed in the earlier Flyshoot project, in which Global Fishing Watch (GFW) data and STECF data were used to analyse fleet-level fishing effort trends in the Channel.
+
+## 2.2 Objectives
+
+- To quantify trends in fishing effort and landings in the Channel (2008/2013–present) using official STECF statistics (AER), with spatial distribution characterised using GFW AIS data.
+- To compile a scientifically grounded overview of the fisheries in the Channel, with particular focus on sustainability, ecosystem effects and the positioning of the flyshoot fishery.
+
+## 2.3 Study area and scope
+
+The study covers ICES divisions 27.4.c (southern North Sea), 27.7.d (eastern English Channel) and 27.7.e (western English Channel). The period of analysis is 2008–present for effort and landings trends (AER) and 2013–present for spatial analysis (GFW).
+
+---
+
+# 3. Material & Methods
+
+## 3.1 STECF AER data (effort and landings trends)
+
+The Annual Economic Report (AER) data were obtained from the STECF 25-07 data release (*EU Fleet Economic and Transversal data, fleet segment level*). The AER provides fishing effort (fishing days, sea days, kW-days, GT-days) and landed weight and value by fleet segment (country × fishing technique × vessel length class), disaggregated by ICES sub-region. Three separate tab-level datasets covering 2008–2012, 2013–2017 and 2018–2023 were concatenated to form a consistent time series.
+
+Effort is expressed primarily as fishing days. Capacity-weighted effort (Section 4.1.2) uses GT-fishing days where reported; for countries that report only kW-fishing days, GT-fishing days are imputed using a fleet-average kW-to-GT conversion ratio of `r kw_to_gt_ratio` (GT per kW), derived from fleet segments in the AER that report both metrics. Imputed values are flagged in the figure.
+
+## 3.2 GFW data (spatial effort distribution and concentration)
+
+Fishing activity data were retrieved via the Global Fishing Watch (GFW) API (`gfwr` v3.0) using the Events endpoint. Vessel metadata (flag state, gear type, gross tonnage) were obtained from the GFW vessel registry. The GFW data are used **exclusively for spatial analysis** — effort density maps, spatial hotspots, and effort concentration metrics. All computationally expensive spatial objects (KDE grids, gridded effort, concentration metrics) are stored in a dedicated cache file (`cache_gfw_spatial.RData`) to avoid recomputation on each knit.
+
+## 3.3 STECF FDI data (reference only)
+
+The STECF FDI dataset was obtained but is not used as a primary analysis source (see table below). The AER provides more complete and consistent country-level data for the same period.
+
+```{r fdi-note-table}
+tibble::tibble(
+  `FDI table` = c("Effort","Landings","Catches","Capacity"),
+  `Key issue` = c(
+    "Substantial confidentiality suppression in key strata",
+    "EU-aggregated only — no country breakdown",
+    "Country-level but with suppressed cells; partial AER overlap",
+    "No division breakdown — national totals only"),
+  `Decision` = rep("Not used", 4)
+) |> knitr::kable(caption = "Table 1. STECF FDI data quality issues and reason for exclusion.")
+```
+
+## 3.4 The 2024 Gentlemen's Agreement
+
+Brief description of the November 2024 multilateral agreement between VisNed (NL), Rederscentrale (BE) and CNPMEM (FR) governing flyshoot fishing in ICES 27.7.d, and its predecessor (April 2021). Key provisions: the 8-sea-day limit per 14-day period, technical gear specifications, and the monitoring obligation. Used as a reference framework for interpreting the fishing effort data in Chapter 4.
+
+---
+
+# 4. Results: Fishing Effort and Landings
+
+## 4.1 Effort trends — STECF AER
+
+### 4.1.1 Total fishing days by year, country and gear category
+
+```{r aer-effort-trend, fig.height=6, fig.cap="Figure 1. Total fishing days in ICES 4.c/7.d/7.e per year by country and gear category (AER, 2008–2023). Source: STECF 25-07."}
+aer_effort_summary |>
+  filter(country_code %in% c("FRA","GBR","NLD","BEL","IRL","DNK")) |>
+  group_by(year, country_code, gear_category) |>
+  summarise(totfishdays = sum(totfishdays, na.rm=TRUE), .groups="drop") |>
+  ggplot(aes(x=year, y=totfishdays, colour=country_code)) +
+  geom_line() + geom_point(size=1.5) +
+  scale_x_continuous(breaks=seq(aer_years_start, 2024, by=2)) +
+  scale_y_continuous(limits=c(0,NA), expand=expansion(mult=c(0,0.05))) +
+  facet_wrap(~gear_category) +
+  labs(title="AER — Fishing days by gear category",
+       subtitle=paste("Divisions:", paste(study_divisions_aer, collapse=" & ")),
+       x="Year", y="Fishing days", colour="Country") +
+  theme_bw() +
+  theme(strip.text=element_text(size=7), axis.text.x=element_text(angle=45, hjust=1))
+```
+
+### 4.1.2 Capacity-weighted effort (GT-fishing days)
+
+Capacity-weighted effort expresses each fishing day weighted by the vessel's gross tonnage (GT), giving a measure of effective fleet capacity deployed. Where GT-fishing days are not reported, they are approximated from kW-fishing days using a fleet-average conversion factor (see Section 3.1). Imputed values are shown with open symbols.
+
+```{r aer-effort-gt-diag, include=FALSE}
+# Diagnostic: which countries report GT vs kW in the AER effort data?
+# This determines which rows feed each branch of gt_fishdays_source.
+aer_capacity_coverage <- aer_effort_capacity_metric |>
+  filter(country_code %in% c("FRA","GBR","NLD","BEL","IRL","DNK")) |>
+  group_by(country_code, gt_fishdays_source) |>
+  summarise(n_rows       = n(),
+            total_metric = sum(gt_fishdays_harmonised, na.rm=TRUE),
+            .groups="drop")
+message("AER capacity metric coverage by country:")
+print(aer_capacity_coverage)
+```
+
+```{r aer-effort-gt, fig.height=7, fig.cap="Figure 2. Capacity-weighted effort by country and gear category (AER, 2008–2023). Countries reporting GT-fishing days directly are shown with filled symbols; countries for which GT-fishing days are imputed from kW-fishing days (using a fleet-average kW-to-GT ratio) are shown with open symbols. Note that most non-French fleets report kW rather than GT in the AER; imputed values carry additional uncertainty."}
+# Build the plot data — keep gt_fishdays_source as a per-row attribute so the
+# shape aesthetic can distinguish reported from imputed within each country.
+# Summarise within year × country × gear × source (not collapsing source).
+aer_effort_capacity_metric |>
+  filter(country_code %in% c("FRA","GBR","NLD","BEL","IRL","DNK"),
+         gt_fishdays_source != "Not available") |>
+  group_by(year, country_code, gear_category, gt_fishdays_source) |>
+  summarise(gt_fishdays_harmonised = sum(gt_fishdays_harmonised, na.rm=TRUE),
+            .groups="drop") |>
+  filter(gt_fishdays_harmonised > 0) |>
+  # For each country, a single source type dominates; the group aesthetic
+  # ensures the line connects points of the same country regardless of source.
+  ggplot(aes(x=year, y=gt_fishdays_harmonised,
+             colour=country_code, shape=gt_fishdays_source,
+             group=country_code)) +
+  geom_line(linewidth=0.7) +
+  geom_point(size=2.5) +
+  scale_shape_manual(
+    values = c("GT (reported)" = 16, "GT (imputed from kW)" = 1),
+    name   = "Metric source") +
+  scale_x_continuous(breaks=seq(aer_years_start, 2024, by=2)) +
+  scale_y_continuous(limits=c(0,NA), expand=expansion(mult=c(0,0.05)),
+                     labels=scales::label_scientific()) +
+  facet_wrap(~gear_category) +
+  labs(title    = "AER — Capacity-weighted effort (GT-fishing days) by gear category",
+       subtitle = paste("Divisions:", paste(study_divisions_aer, collapse=" & "),
+                        " | Filled = GT reported; Open = GT imputed from kW"),
+       x="Year", y="GT-fishing days (reported or imputed)", colour="Country") +
+  theme_bw() +
+  theme(strip.text=element_text(size=7), axis.text.x=element_text(angle=45, hjust=1),
+        legend.position="bottom",
+        legend.box="vertical")
+```
+
+### 4.1.3 Seasonal patterns
+
+```{r aer-effort-seasonal, fig.cap="Figure 3. Seasonal distribution of fishing days by gear category (AER)."}
+# TODO: quarterly breakdown where available in AER effort data
+```
+
+---
+
+## 4.2 Landings trends — STECF AER
+
+### 4.2.1 Total landed weight by year, country and gear
+
+```{r aer-landings-total, fig.height=6, fig.cap="Figure 4. Landed weight (t) in ICES 4.c/7.d/7.e by country and gear category (AER, 2008–2023)."}
+aer_landings_summary |>
+  filter(country_code %in% c("FRA","GBR","NLD","BEL")) |>
+  group_by(year, country_code, gear_category) |>
+  summarise(live_weight_t=sum(live_weight_t, na.rm=TRUE), .groups="drop") |>
+  ggplot(aes(x=year, y=live_weight_t, colour=country_code)) +
+  geom_line() + geom_point(size=1.5) +
+  scale_x_continuous(breaks=seq(aer_years_start, 2024, by=2)) +
+  scale_y_continuous(limits=c(0,NA), expand=expansion(mult=c(0,0.05))) +
+  facet_wrap(~gear_category) +
+  labs(title="AER — Landed weight by gear category",
+       subtitle=paste("Divisions:", paste(study_divisions_aer, collapse=" & ")),
+       x="Year", y="Landed weight (t)", colour="Country") +
+  theme_bw() +
+  theme(strip.text=element_text(size=7), axis.text.x=element_text(angle=45, hjust=1))
+```
+
+### 4.2.2 Key species groups — landings by country
+
+```{r aer-landings-species-country, fig.width=10, fig.height=7, fig.cap="Figure 5. Landings by key species group and country (AER, 2008–2023). Bars show stacked country contributions per year."}
+aer_landings_summary |>
+  filter(country_code %in% c("FRA","GBR","NLD","BEL"), year < 2024) |>
+  mutate(species_group = assign_species_group(species_code, species_name)) |>
+  filter(!is.na(species_group)) |>
+  group_by(year, country_code, species_group) |>
+  summarise(live_weight_t=sum(live_weight_t, na.rm=TRUE), .groups="drop") |>
+  complete(year, country_code, species_group, fill=list(live_weight_t=0)) |>
+  mutate(country_code  = factor(country_code, levels=c("FRA","GBR","NLD","BEL")),
+         species_group = factor(species_group, levels=species_group_levels)) |>
+  ggplot(aes(x=year, y=live_weight_t, fill=country_code)) +
+  geom_col(position="stack", width=0.8) +
+  scale_fill_brewer(palette="Set1") +
+  scale_x_continuous(breaks=seq(aer_years_start, 2024, by=2)) +
+  scale_y_continuous(limits=c(0,NA), expand=expansion(mult=c(0,0.05))) +
+  facet_wrap(~species_group, nrow=3) +
+  labs(title="AER — Landings by key species group and country",
+       subtitle=paste("Divisions:", paste(study_divisions_aer, collapse=" & ")),
+       caption="Countries stacked additively",
+       x="Year", y="Landed weight (t)", fill="Country") +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=45, hjust=1),
+        strip.text=element_text(size=7), legend.position="bottom")
+```
+
+### 4.2.3 Key species groups — landings by gear category
+
+```{r aer-landings-species-gear, fig.width=10, fig.height=7, fig.cap="Figure 6. Landings by key species group and gear category (AER, 2008–2023). Bars show stacked gear contributions per year across all countries."}
+aer_landings_summary |>
+  filter(country_code %in% c("FRA","GBR","NLD","BEL"), year < 2024) |>
+  mutate(species_group = assign_species_group(species_code, species_name)) |>
+  filter(!is.na(species_group)) |>
+  group_by(year, gear_category, species_group) |>
+  summarise(live_weight_t=sum(live_weight_t, na.rm=TRUE), .groups="drop") |>
+  complete(year, gear_category, species_group, fill=list(live_weight_t=0)) |>
+  mutate(species_group = factor(species_group, levels=species_group_levels)) |>
+  ggplot(aes(x=year, y=live_weight_t, fill=gear_category)) +
+  geom_col(position="stack", width=0.8) +
+  scale_fill_brewer(palette="Set2") +
+  scale_x_continuous(breaks=seq(aer_years_start, 2024, by=2)) +
+  scale_y_continuous(limits=c(0,NA), expand=expansion(mult=c(0,0.05))) +
+  facet_wrap(~species_group, nrow=3) +
+  labs(title="AER — Landings by key species group and gear category",
+       subtitle=paste("Divisions:", paste(study_divisions_aer, collapse=" & ")),
+       caption="All countries combined",
+       x="Year", y="Landed weight (t)", fill="Gear category") +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=45, hjust=1),
+        strip.text=element_text(size=7), legend.position="bottom")
+```
+
+### 4.2.4 Focal species × focal gears
+
+The following figure focuses on the species and gear combinations most relevant to the flyshoot and associated fisheries: cuttlefish, squid, gurnards, mullets, scallops and whelk, caught by bottom trawl/seine, beam trawl, dredge, pot/trap and gillnet.
+
+```{r aer-landings-focal, fig.width=11, fig.height=8, fig.cap="Figure 7. Landings of focal species by focal gear category in ICES 4.c/7.d/7.e (AER, 2008–2023). Each panel shows one species group; colours represent gear categories. Only gear categories accounting for >1% of total landings for that species in the study area are shown. Free y-axis per species group."}
+focal_species <- c("Cuttlefish","Squid","Gurnards","Mullets","Scallops","Whelk")
+
+aer_landings_summary |>
+  filter(country_code %in% c("FRA","GBR","NLD","BEL"),
+         sub_reg %in% study_divisions_aer,          # study area only
+         year < 2024) |>
+  mutate(species_group = assign_species_group(species_code, species_name)) |>
+  filter(!is.na(species_group), species_group %in% focal_species,
+         gear_category %in% focal_gears) |>
+  group_by(year, gear_category, species_group) |>
+  summarise(live_weight_t=sum(live_weight_t, na.rm=TRUE), .groups="drop") |>
+  # Drop gear × species combos that never reach 1% of that species' total
+  group_by(species_group, gear_category) |>
+  mutate(gear_total = sum(live_weight_t)) |>
+  group_by(species_group) |>
+  mutate(species_total = sum(live_weight_t),
+         gear_pct = gear_total / species_total * 100) |>
+  ungroup() |>
+  filter(gear_pct >= 1) |>
+  complete(year, gear_category, species_group, fill=list(live_weight_t=0)) |>
+  mutate(species_group = factor(species_group, levels=focal_species)) |>
+  ggplot(aes(x=year, y=live_weight_t, fill=gear_category)) +
+  geom_col(position="stack", width=0.8) +
+  scale_fill_brewer(palette="Set2") +
+  scale_x_continuous(breaks=seq(aer_years_start, 2024, by=2)) +
+  scale_y_continuous(limits=c(0,NA), expand=expansion(mult=c(0,0.05))) +
+  facet_wrap(~species_group, nrow=2, scales="free_y") +
+  labs(title    = "AER — Focal species landings by gear category",
+       subtitle = paste0("Study area: ICES ", paste(study_divisions_aer, collapse=" & "),
+                         "  |  FRA, GBR, NLD, BEL combined"),
+       caption  = "Only gears ≥1% of species total shown. Free y-axis per species group.",
+       x="Year", y="Landed weight (t)", fill="Gear category") +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=45, hjust=1),
+        strip.text=element_text(size=8), legend.position="bottom")
+```
+
+### 4.2.5 Top species by landed weight
+
+```{r aer-landings-top-species, fig.height=5, fig.cap="Figure 8. Top 15 species by total landed weight in ICES 4.c/7.d/7.e across FRA, GBR, NLD and BEL (AER, 2008–2023)."}
+aer_landings_summary |>
+  filter(country_code %in% c("FRA","GBR","NLD","BEL"),
+         sub_reg %in% study_divisions_aer) |>        # study area only
+  group_by(species_code, species_name) |>
+  summarise(total_t=sum(live_weight_t, na.rm=TRUE), .groups="drop") |>
+  slice_max(total_t, n=15) |>
+  mutate(species_label = paste0(species_name," (",species_code,")"),
+         species_label = fct_reorder(species_label, total_t)) |>
+  ggplot(aes(x=total_t/1000, y=species_label)) +
+  geom_col(fill="#4E79A7") +
+  scale_x_continuous(limits=c(0,NA), expand=expansion(mult=c(0,0.03))) +
+  labs(title    = "AER — Top 15 species by total landed weight",
+       subtitle = paste0("Study area: ICES ", paste(study_divisions_aer, collapse=" & "),
+                         "  |  FRA, GBR, NLD, BEL  |  2008–2023"),
+       x="Total landed weight (1000 t)", y="") +
+  theme_bw()
+```
+
+---
+
+## 4.3 Fleet composition by country and gear type — STECF AER
+
+```{r aer-fleet-composition-diag, include=FALSE}
+# Diagnostic: confirm which countries and sub_regs are present in effort summary
+message("Countries in aer_effort_summary:")
+print(sort(unique(aer_effort_summary$country_code)))
+message("sub_reg values in aer_effort_summary:")
+print(sort(unique(aer_effort_summary$sub_reg)))
+message("Effort rows per country (study area, 2013+):")
+aer_effort_summary |>
+  filter(sub_reg %in% study_divisions_aer, year >= 2013) |>
+  count(country_code, sort=TRUE) |>
+  print()
+```
+
+```{r aer-fleet-composition, fig.height=6, fig.cap="Figure 9. Fishing days by country and gear category in the study area (AER, 2013–2023). Bars show stacked gear contributions. Only countries with reported effort in ICES 4.c/7.d/7.e are shown."}
+aer_effort_summary |>
+  filter(sub_reg %in% study_divisions_aer,           # study area only
+         year >= 2013) |>
+  group_by(year, country_code, gear_category) |>
+  summarise(totfishdays = sum(totfishdays, na.rm=TRUE), .groups="drop") |>
+  # Only show countries with at least some reported effort
+  group_by(country_code) |>
+  filter(sum(totfishdays) > 0) |>
+  ungroup() |>
+  ggplot(aes(x=year, y=totfishdays, fill=gear_category)) +
+  geom_col(position="stack", width=0.8) +
+  scale_fill_brewer(palette="Set2") +
+  scale_x_continuous(breaks=seq(2013, 2024, by=2)) +
+  scale_y_continuous(limits=c(0,NA), expand=expansion(mult=c(0,0.05))) +
+  facet_wrap(~country_code) +
+  labs(title    = "AER — Fleet composition: fishing days by gear category",
+       subtitle = paste0("Study area: ICES ", paste(study_divisions_aer, collapse=" & ")),
+       x="Year", y="Fishing days", fill="Gear category") +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=45, hjust=1),
+        strip.text=element_text(size=9), legend.position="bottom")
+```
+
+---
+
+## 4.4 GFW effort — total fishing days and comparison with AER
+
+### 4.4.1 Total GFW fishing days by year and flag state
+
+```{r gfw-plot-flag-total, fig.cap="Figure 10. Total GFW fishing days per year by flag state (all divisions, 2013–2025)."}
+fishing_days_study %>%
+  filter(year %in% study_years) %>%
+  group_by(year, vessel_flag) %>%
+  summarise(fishing_days=sum(fishing_days), .groups="drop") %>%
+  apply_flag_other() %>%
+  group_by(year, vessel_flag) %>%
+  summarise(fishing_days=sum(fishing_days), .groups="drop") %>%
+  ggplot(aes(x=year, y=fishing_days, fill=vessel_flag)) +
+  theme_bw() + geom_col() +
+  scale_fill_manual(values=flag_colours, na.value="grey70") +
+  scale_x_continuous(breaks=study_years) +
+  scale_y_continuous(limits=c(0,NA), expand=expansion(mult=c(0,0.05))) +
+  theme(axis.text.x=element_text(angle=90, vjust=0.5)) +
+  labs(x="", y="Fishing days", fill="Flag",
+       title="GFW — Fishing days by year and flag state")
+```
+
+### 4.4.2 AER vs GFW effort comparison
+
+The two data sources measure effort differently — AER reports administrative fishing days declared by member states; GFW estimates fishing days from AIS vessel-tracking. The comparison below shows total fishing days (all gears, all countries combined) over the overlapping period 2013–2023.
+
+```{r aer-gfw-comparison, fig.height=5, fig.cap="Figure 11. Comparison of total fishing days from AER (administrative records) and GFW (AIS-based estimation), 2013–2023. Both sources cover ICES 4.c/7.d/7.e; AER is summed across FRA, GBR, NLD and BEL; GFW covers all flag states."}
+# AER total: all four main countries, all gears, all divisions, overlapping years
+aer_total <- aer_effort_summary |>
+  filter(country_code %in% c("FRA","GBR","NLD","BEL"),
+         year %in% intersect(study_years, seq(aer_years_start, 2023))) |>
+  group_by(year) |>
+  summarise(fishing_days=sum(totfishdays, na.rm=TRUE), .groups="drop") |>
+  mutate(source="AER (FRA+GBR+NLD+BEL)")
+
+# GFW total: all flags, all divisions
+gfw_total <- fishing_days_study %>%
+  filter(year %in% intersect(study_years, seq(aer_years_start, 2023))) %>%
+  group_by(year) %>%
+  summarise(fishing_days=sum(fishing_days), .groups="drop") %>%
+  mutate(source="GFW (all flags)")
+
+bind_rows(aer_total, gfw_total) |>
+  ggplot(aes(x=year, y=fishing_days/1000, colour=source, shape=source)) +
+  geom_line(linewidth=1) + geom_point(size=2.5) +
+  scale_x_continuous(breaks=seq(2013, 2023, by=1)) +
+  scale_y_continuous(limits=c(0,NA), expand=expansion(mult=c(0,0.05))) +
+  scale_colour_manual(values=c("AER (FRA+GBR+NLD+BEL)"="#E15759",
+                                "GFW (all flags)"="#4E79A7")) +
+  scale_shape_manual(values=c("AER (FRA+GBR+NLD+BEL)"=16,
+                               "GFW (all flags)"=17)) +
+  labs(title="Effort comparison: AER vs GFW",
+       subtitle=paste("Divisions:", paste(study_divisions_aer, collapse=" & ")),
+       x="Year", y="Fishing days (1000)", colour="Source", shape="Source") +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=45, hjust=1), legend.position="bottom")
+```
+
+---
+
+## 4.5 GFW effort — spatial distribution
+
+### 4.5.1 Spatial distribution of fishing events
+
+```{r gfw-plot-spatial-all, fig.cap="Figure 12. Spatial distribution of GFW fishing events (random sample of 20,000), all years combined, coloured by flag state."}
+sample_size <- 20000
+events_sample <- events_classified_fr %>%
+  dplyr::select(-any_of(c("vessel_flag","vessel_name"))) %>%
+  left_join(vessel_meta %>% dplyr::select(vesselId, vessel_flag), by="vesselId") %>%
+  mutate(vessel_flag = case_when(
+    is.na(vessel_flag)                   ~ "Other",
+    vessel_flag %in% names(flag_colours) ~ vessel_flag,
+    TRUE                                 ~ "Other")) %>%
+  slice_sample(n=sample_size)
+
+ggplot() +
+  theme_bw() +
+  geom_sf(data=fao_div_proj, fill=NA, colour="grey60", linewidth=0.3) +
+  geom_sf(data=world_proj, fill="grey90", colour="grey70", linewidth=0.2) +
+  geom_point(data=events_sample,
+             aes(x=lon, y=lat, colour=vessel_flag),
+             size=0.5, alpha=0.9) +
+  scale_colour_manual(values=flag_colours, na.value="grey70") +
+  coord_sf(xlim=xlim, ylim=ylim, expand=FALSE) +
+  guides(colour=guide_legend(override.aes=list(size=3, alpha=1))) +
+  theme(axis.text=element_blank(), axis.ticks=element_blank(),
+        axis.title=element_blank(), legend.position="bottom") +
+  labs(colour="Flag",
+       title=paste0("GFW fishing events — all years (sample of ", sample_size, ")"),
+       subtitle="ICES 27.4.C / 27.7.D / 27.7.E  |  Internal waters excluded")
+```
+
+### 4.5.2 Kernel density — all divisions
+
+```{r gfw-plot-kde, fig.height=10, fig.cap="Figure 13. Kernel density of GFW fishing effort for all fleets combined, faceted by year. Bandwidth σ = 20 km. Density normalised within each year (0 = minimum, 1 = maximum)."}
+ggplot() +
+  theme_bw() +
+  geom_tile(data=kde_results, aes(x=x, y=y, fill=ndensity)) +
+  scale_fill_viridis_c(option="inferno", name="Relative\ndensity",
+                       limits=c(0,1), breaks=c(0,0.5,1),
+                       labels=c("Low","Mid","High"), na.value="transparent") +
+  geom_sf(data=world_proj, fill="grey85", colour="grey60", linewidth=0.2) +
+  geom_sf(data=fao_div_proj, fill=NA, colour="grey30", linewidth=0.4) +
+  coord_sf(crs=crs_proj,
+           xlim=st_bbox(study_window_proj)[c("xmin","xmax")],
+           ylim=st_bbox(study_window_proj)[c("ymin","ymax")],
+           expand=TRUE) +
+  theme(axis.text=element_blank(), axis.ticks=element_blank(),
+        axis.title=element_blank(), legend.position="bottom",
+        strip.background=element_rect(fill="grey90"),
+        strip.text=element_text(face="bold", colour="grey20")) +
+  labs(title=paste0("GFW — Fishing effort density, all fleets (σ = ", sigma_all/1000, " km)"),
+       subtitle="Normalised per year  |  Land excluded") +
+  facet_wrap(~year, ncol=5)
+```
+
+### 4.5.3 Kernel density — ICES 27.7.D
+
+```{r gfw-plot-kde-7d, fig.height=10, fig.cap="Figure 14. Kernel density of GFW fishing effort in ICES 27.7.D, faceted by year. Bandwidth σ = 10 km."}
+ggplot() +
+  theme_bw() +
+  geom_tile(data=kde_7d, aes(x=x, y=y, fill=ndensity)) +
+  scale_fill_viridis_c(option="inferno", name="Relative\ndensity",
+                       limits=c(0,1), na.value="transparent") +
+  geom_sf(data=world_proj, fill="grey40", colour="grey60", linewidth=0.2) +
+  geom_sf(data=fao_div_proj %>% filter(division=="27.7.D"),
+          fill=NA, colour="white", linewidth=0.5) +
+  coord_sf(crs=crs_proj,
+           xlim=bbox_7d_proj[c("xmin","xmax")],
+           ylim=bbox_7d_proj[c("ymin","ymax")],
+           expand=TRUE) +
+  theme(axis.text=element_blank(), axis.ticks=element_blank(),
+        axis.title=element_blank(), legend.position="bottom",
+        strip.background=element_rect(fill="grey90"),
+        strip.text=element_text(face="bold", colour="grey20")) +
+  labs(title=paste0("GFW — Fishing effort density ICES 27.7.D (σ = ", sigma_7d/1000, " km)"),
+       subtitle="Normalised per year  |  Land excluded") +
+  facet_wrap(~year)
+```
+
+### 4.5.4 Annual effort hotspot maps — ICES 27.7.D
+
+```{r gfw-plot-hotspots, fig.height=12, fig.cap="Figure 15. Annual fishing effort per 5 km grid cell in ICES 27.7.D. Colour scale capped at the 99th percentile of non-zero cells."}
+scale_cap <- quantile(cell_effort_full$n_events[cell_effort_full$n_events > 0],
+                      0.99, na.rm=TRUE)
+quants    <- quantile(cell_effort_full$n_events[cell_effort_full$n_events > 0],
+                      c(0.50,0.75,0.90,0.95,0.99), na.rm=TRUE)
+
+safe_gradientn <- function(raw_breaks, palette_colours) {
+  upper <- max(c(raw_breaks, 1), na.rm=TRUE)
+  pts   <- sort(unique(c(0, raw_breaks[raw_breaks > 0 & raw_breaks <= upper], upper)))
+  if (length(pts) < 2) pts <- c(0, upper)
+  list(colours=colorRampPalette(palette_colours)(length(pts)),
+       values=scales::rescale(pts),
+       limits=c(0, upper))
+}
+palette_7 <- c("white","#c7e9b4","#7fcdbb","#41b6c4","#1d91c0","#225ea8","#0c2c84")
+grad <- safe_gradientn(c(quants["50%"],quants["75%"],quants["90%"],
+                         quants["95%"],quants["99%"],scale_cap), palette_7)
+
+cell_effort_full %>%
+  mutate(n_events_capped=pmin(n_events, scale_cap)) %>%
+  ggplot() +
+  theme_bw() +
+  geom_tile(aes(x=x_cell, y=y_cell, fill=n_events_capped)) +
+  scale_fill_gradientn(colours=grad$colours, values=grad$values,
+                       name="Events\nper cell", limits=grad$limits,
+                       na.value="grey92") +
+  geom_sf(data=world_proj, fill="grey80", colour="grey60", linewidth=0.2) +
+  geom_sf(data=fao_div_proj %>% filter(division=="27.7.D"),
+          fill=NA, colour="grey30", linewidth=0.5) +
+  coord_sf(crs=crs_proj,
+           xlim=bbox_7d_proj[c("xmin","xmax")],
+           ylim=bbox_7d_proj[c("ymin","ymax")],
+           expand=TRUE) +
+  theme(axis.text=element_blank(), axis.ticks=element_blank(),
+        axis.title=element_blank(), legend.position="bottom",
+        legend.key.width=unit(2,"cm"),
+        strip.background=element_rect(fill="grey90"),
+        strip.text=element_text(face="bold", colour="grey20")) +
+  labs(title=paste0("GFW — Fishing effort hotspots ICES 27.7.D  |  ",
+                    cell_size/1000, " km grid"),
+       subtitle=paste0("Scale capped at p99 (", round(scale_cap), " events)")) +
+  facet_wrap(~year, ncol=5)
+```
+
+---
+
+## 4.6 GFW effort — spatial concentration (ICES 27.7.D)
+
+### 4.6.1 Gini coefficient and top-10% cell share
+
+```{r gfw-plot-concentration, fig.height=4, fig.cap="Figure 16. Spatial concentration of fishing effort in ICES 27.7.D: Gini coefficient (left) and percentage of total effort in the top-10% most-fished 5 km grid cells (right), 2013–2025."}
+p_gini <- ggplot(concentration_7d, aes(x=year, y=gini)) +
+  theme_bw() +
+  geom_line(colour="#E15759", linewidth=1) + geom_point(colour="#E15759", size=3) +
+  geom_text(aes(label=round(gini,3)), vjust=-0.8, size=2.8) +
+  scale_x_continuous(breaks=study_years) +
+  scale_y_continuous(limits=c(0,1), labels=scales::number_format(accuracy=0.01)) +
+  theme(axis.text.x=element_text(angle=90, vjust=0.5)) +
+  labs(x="", y="Gini coefficient", title="Gini coefficient")
+
+p_top10 <- ggplot(concentration_7d, aes(x=year, y=top10_pct)) +
+  theme_bw() +
+  geom_line(colour="#4E79A7", linewidth=1) + geom_point(colour="#4E79A7", size=3) +
+  geom_text(aes(label=paste0(round(top10_pct,1),"%")), vjust=-0.8, size=2.8) +
+  scale_x_continuous(breaks=study_years) +
+  scale_y_continuous(limits=c(0,NA), expand=expansion(mult=c(0,0.15)),
+                     labels=scales::percent_format(scale=1)) +
+  theme(axis.text.x=element_text(angle=90, vjust=0.5)) +
+  labs(x="", y="% of total effort", title="Top-10% cell share")
+
+p_gini + p_top10 +
+  plot_annotation(
+    title    = paste0("GFW — Effort concentration ICES 27.7.D  |  ",
+                      cell_size/1000, " km grid  |  All fleets"),
+    subtitle = "Left: Gini coefficient (0=uniform, 1=fully concentrated). Right: % effort in top-10% cells.")
+```
+
+---
+
+# 5. Results: Literature Review
+
+## 5.1 Overview of the Channel fisheries
+
+*[Synthesis of ICES WGCSE, STECF, national sources on fleet composition in 27.7.d/e]*
+
+## 5.2 Stock status and ICES advice
+
+*Key target species: horse mackerel, sea bass, monkfish, megrim, demersal species in 27.7.d/e. Scallops (Pecten maximus): Baie de Seine, Baie de Saint-Brieuc, western Channel. Note 2024–2025 record scallop season (~48,000 t) and UK MMO concerns on western Channel biomass.*
+
+## 5.3 Ecosystem effects: seabed disturbance
+
+*Synthesis on seabed disturbance footprint of flyshoot vs. beam and otter trawl; bycatch and discards; scallop dredging effects. Key sources: Eigaard et al. 2017, Hiddink et al. 2017, ICES WGECO.*
+
+## 5.4 Sustainability frameworks and management
+
+*MSC certification status (scallop: Baie de Saint-Brieuc since 2022, Baie de Seine since November 2024). CFP quota framework, technical measures, the 2024 gentlemen's agreement as self-regulation.*
+
+---
+
+# 6. Discussion & Synthesis
+
+## 6.1 Effort trends and fleet position
+
+*Integrative interpretation of AER effort trends and GFW spatial patterns. How has effort in the Channel developed since 2008/2013? What is the position of the Vrolijk fleet within the total effort picture?*
+
+## 6.2 Comparison of AER and GFW effort metrics
+
+*Where AER and GFW tell the same story vs. where they diverge (see Figure 11). Limitations of each source. Note on why FDI was not used for primary analysis (see Section 3.3).*
+
+## 6.3 Compliance with the 2024 gentlemen's agreement
+
+*What does the available data show about compliance with sea-day limits and gear specifications? Contribution to the monitoring obligation.*
+
+## 6.4 Sustainability position
+
+*Evidence-based strengths (lower seabed disturbance than beam trawl, data transparency, MSC-certified scallops) and points requiring honest acknowledgement.*
+
+## 6.5 Responding to public criticism
+
+*How do the findings relate to critical media coverage (Follow the Money)? What is substantiated, what merits nuance, what is unresolved?*
+
+---
+
+# 7. Conclusions & Recommendations
+
+## 7.1 Conclusions
+
+*[To be written after completion of analyses.]*
+
+## 7.2 Recommendations for sustainability communication
+
+*Recommendations for Vrolijk's communication towards clients, media, policy-makers. Suggestions for ongoing monitoring consistent with the 2024 agreement obligations.*
+
+---
+
+# Annexes
+
+## Annex A — Data sources
+
+| Dataset | Source | Period | Role in this report |
+|---------|--------|--------|---------------------|
+| STECF AER | STECF 25-07 | 2008–2023 | Primary: effort trends, landings |
+| GFW Events API | GFW API v3 (`gfwr` 3.0) | 2013–2025 | Spatial analysis only |
+| GFW Vessel registry | GFW | 2013–2025 | Flag, gear type, GT |
+| STECF FDI | STECF 2025 release | 2013–2024 | QA reference only |
+| ICES FAO shapefiles | ICES/FAO | — | ICES division polygons |
+
+## Annex B — Technical methods
+
+- `AER_channel_analysis.R` — AER data loading, cleaning, summaries and plots
+- `FDI_channel_analysis.R` — FDI data loading, cleaning, QA (reference)
+- `GFW_effort_report.Rmd` — GFW extraction, spatial analysis, KDE, concentration
+- `channel_fisheries_combined_report.Rmd` — this document
+
+Cache files in `output/cache/`:
+
+| File | Contents | Rebuilt when |
+|------|----------|--------------|
+| `cache_aer.RData` | `aer_effort_summary`, `aer_effort_capacity_metric`, `aer_landings_summary` | AER Excel file is newer |
+| `cache_gfw.RData` | `fishing_days_study`, `events_classified_fr`, `vessel_meta`, `fao_sf_division`, `world` | Any GFW pipeline `.RData` is newer |
+| `cache_gfw_spatial.RData` | KDE grids, gridded effort, concentration metrics | `cache_gfw.RData` is newer |
+| `cache_fdi.RData` | `fdi_days`, `fdi_catches` | FDI CSV outputs are newer |
+
+Delete any cache file to force a full rebuild on the next knit.
+
+## Annex C — References
+
+*[Full reference list to be added.]*
+
+## Annex D — Supplementary figures
+
+*[Additional maps and charts not included in the main text.]*
+
+---
+
+# Session information
+
+```{r session-info}
+sessionInfo()
+```

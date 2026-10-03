@@ -1,0 +1,1740 @@
+---
+title: "Fishing in the English Channel: Trends in Fishing Effort, Ecosystem Impacts and Sustainability"
+subtitle: "A combined analysis using STECF AER, GFW and STECF FDI data (2008–2025)"
+author: "Martin Pastoors"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+client: "Vrolijk"
+output:
+  word_document:
+    reference_docx: "../report_template.dotx"
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 8,
+  fig.height = 5,
+  dpi        = 150
+)
+```
+
+<!-- =========================================================
+     LIBRARIES
+     ========================================================= -->
+
+```{r libraries}
+# Core
+library(tidyverse)
+library(lubridate)
+library(readxl)
+library(janitor)
+library(patchwork)    # combine panels for AER vs GFW comparison
+
+# Spatial (GFW section)
+library(sf)
+library(spatstat)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(ggnewscale)  # second independent colour scale (windfarm status) alongside flag-state colour
+
+# Concentration metrics (GFW section)
+library(ineq)
+```
+
+<!-- =========================================================
+     SETTINGS — edit paths here
+     ========================================================= -->
+
+```{r settings}
+# ---- Directory paths --------------------------------------------------------
+spatialdir  <- "C:/Users/MartinPastoors/OneDrive - Martin Pastoors/DATA/RDATA"
+flyshootdir <- "C:/Users/MartinPastoors/Martin Pastoors/FLYSHOOT - General/data"
+aer_file    <- "C:/Users/MartinPastoors/Martin Pastoors/MPFF - General/PROJECTS/FLYSHOOT/STECF 2025-07_AER_data/STECF_25 07_EU Fleet Economic and Transversal data_fleet segment level.xlsx"
+fdi_dir     <- "C:/Users/MartinPastoors/Martin Pastoors/MPFF - General/PROJECTS/FLYSHOOT/stecf 2025_Effort-landings-catches-capacity-biological"
+out_dir     <- "C:/Users/MartinPastoors/Martin Pastoors/MPFF - General/PROJECTS/FLYSHOOT/output"
+cache_dir   <- file.path(out_dir, "cache")
+
+if (!dir.exists(out_dir))   dir.create(out_dir,   recursive = TRUE)
+if (!dir.exists(cache_dir)) dir.create(cache_dir, recursive = TRUE)
+
+# ---- Cache file paths -------------------------------------------------------
+aer_cache     <- file.path(cache_dir, "cache_aer.RData")
+gfw_cache     <- file.path(cache_dir, "cache_gfw.RData")
+fdi_cache     <- file.path(cache_dir, "cache_fdi.RData")
+spatial_cache <- file.path(cache_dir, "cache_gfw_spatial.RData")
+  # spatial_cache stores all heavy computed spatial objects:
+  #   land_study, study_window_proj, study_owin, world_proj, fao_div_proj,
+  #   kde_results (all-area KDE), kde_7d (7D KDE),
+  #   cell_effort_7d, concentration_7d, cell_effort_full
+
+# ---- Study parameters -------------------------------------------------------
+study_years     <- 2013:2025
+aer_years_start <- 2008
+study_divisions_gfw <- c("27.4.C", "27.7.D", "27.7.E")
+study_divisions_aer <- c("27.7.d", "27.7.e", "27.4.c")
+study_divisions_fdi <- c("4.C", "7.D", "7.E")
+
+threshold_pct <- 1
+xlim <- c(-7, 8)
+ylim <- c(48, 54)
+
+# ---- Colour palettes --------------------------------------------------------
+flag_colours <- c(
+  "BEL"   = "#4E79A7",
+  "NLD"   = "#F28E2B",
+  "GBR"   = "#59A14F",
+  "FRA"   = "#E15759",
+  "DEU"   = "#76B7B2",
+  "Other" = "#BAB0AC"
+)
+
+size_colours <- c(
+  "S1 <100 GT"     = "#1D9E75",
+  "S2 100-300 GT"  = "#BA7517",
+  "S3 300-600 GT"  = "#7F77DD",
+  "S4 600-1200 GT" = "#D85A30",
+  "S5 >1200 GT"    = "#A32D2D"
+)
+
+# ---- KW-to-GT conversion ----------------------------------------------------
+# Approximate fleet-average ratio used when one metric is missing.
+# Derived from AER fleet segments that report both; update if better data become
+# available. Ratio defined as GT per kW (median across vessel-length classes).
+# NOTE: this is a fleet-level approximation only — individual vessel ratios vary
+# considerably. Applied only where totgtfishdays is NA and totkwfishdays > 0.
+kw_to_gt_ratio <- 0.55   # GT = kW * kw_to_gt_ratio (fleet average)
+
+# ---- Country lists ----------------------------------------------------------
+# GBR is excluded from all AER analyses — no data in the AER series.
+# GBR is retained in the GFW series where it has full AIS coverage.
+report_countries_aer <- c("DEU","NLD","BEL","FRA")
+report_countries_gfw <- c("DEU","NLD","BEL","FRA","GBR")
+
+# ---- Gear filters -----------------------------------------------------------
+# Selected gears used across capacity-weighted effort (Fig 2), landings by
+# country (Fig 5), landings by gear (Fig 6), focal species (Fig 7),
+# top species (Fig 8) and fleet composition (Fig 9).
+capacity_gears <- c("Bottom trawl/seine", "Beam trawl", "Dredge")
+
+# Full focal gear list for Fig 7 (focal species × gear)
+focal_gears_full <- c("Bottom trawl/seine", "Beam trawl", "Dredge",
+                      "Pot/trap", "Gillnet")
+```
+
+<!-- =========================================================
+     HELPER FUNCTIONS
+     ========================================================= -->
+
+```{r helpers-gfw}
+load_object <- function(filepath, object_name) {
+  local({
+    e <- new.env()
+    load(filepath, envir = e)
+    e[[object_name]]
+  })
+}
+
+# msg() — like message() but flushes immediately to the RStudio console.
+# Useful when running chunks interactively: without flush.console(), messages
+# from inside long-running blocks are buffered and only appear after the block
+# completes, making it look like nothing is happening.
+msg <- function(...) {
+  message(...)
+  flush.console()
+}
+
+apply_flag_other <- function(df, flag_col = "vessel_flag",
+                              days_col = "fishing_days") {
+  df %>%
+    group_by(across(all_of(flag_col))) %>%
+    mutate(total_flag_days = sum(.data[[days_col]])) %>%
+    ungroup() %>%
+    mutate(
+      total_days = sum(.data[[days_col]]),
+      flag_pct   = total_flag_days / total_days * 100,
+      across(all_of(flag_col),
+             ~ if_else(flag_pct < threshold_pct, "Other", .x))
+    )
+}
+```
+
+```{r helpers-aer}
+map_gear_aer <- function(x) {
+  dplyr::recode(str_to_upper(str_trim(x)),
+    DTS = "Bottom trawl/seine", TBB = "Beam trawl",
+    PEL = "Midwater trawl",     DFN = "Gillnet",
+    HOK = "Handline/rod",       FPO = "Pot/trap",
+    DRB = "Dredge",             PS  = "Purse seine",
+    LL  = "Longline",
+    .default = "Other/mixed"
+  )
+}
+
+# Species group lookup — used in multiple landings plots
+assign_species_group <- function(species_code, species_name) {
+  sn <- tolower(species_name)
+  case_when(
+    str_detect(sn, "cuttlefish|sepia") |
+      species_code %in% c("CTC","CTL","CTZ","CTB","CTS","SEB","OCC")
+      ~ "Cuttlefish",
+    str_detect(sn, "squid|loligo|bobtail|ommastrep|shortfin") |
+      species_code %in% c("SQC","SQR","SQE","SQM","LOL","LOG","SQS","SQZ",
+                           "SQX","EUR","BOC","SQI","OMS","TOD","NBS","OMP","ILL")
+      ~ "Squid",
+    str_detect(sn, "mullet") |
+      species_code %in% c("MUL","MUG","TFM","MUT","MUX")
+      ~ "Mullets",
+    str_detect(sn, "gurnard|searobin") |
+      species_code %in% c("GUG","GUR","GUU","GUX","TUB","BIR")
+      ~ "Gurnards",
+    str_detect(sn, "^mackerel") |
+      species_code %in% c("MAC","MAS")
+      ~ "Mackerel",
+    str_detect(sn, "horse mackerel|scad") |
+      species_code %in% c("HOM","HMM","JAA","JAX")
+      ~ "Horse mackerel",
+    str_detect(sn, "whiting") |
+      species_code %in% c("WHG")
+      ~ "Whiting",
+    str_detect(sn, "scallop|pecten") |
+      species_code %in% c("SCE","QSC","PEC","SCA","SCB")
+      ~ "Scallops",
+    str_detect(sn, "whelk|buccinidae|buccinum") |
+      species_code %in% c("WHE","BUC")
+      ~ "Whelk",
+    # Shrimps — brown shrimp, northern shrimp and other Crangonidae/Pandalidae
+    str_detect(sn, "shrimp|crangon|pandalus|crevette") |
+      species_code %in% c("CSH","PRA","TGS","CRG","CPR","SQS","PAN","CFW")
+      ~ "Shrimps",
+    # Flatfishes — code-first matching (FAO 3-alpha codes are reliable in AER;
+    # species names vary by language/convention between member states).
+    # Covers all flatfish species regularly recorded in Channel landings.
+    species_code %in% c(
+      # Soles
+      "SOL","SOM","SOO","SOZ",
+      # Plaice
+      "PLE",
+      # Turbot & brill
+      "TUR","BLL",
+      # Dab & flounder
+      "DAB","FLE",
+      # Megrim (Lepidorhombus spp.)
+      "MEG","LDB","MES",
+      # Lemon sole / witch / scaldfish
+      "LEM","WIT","SCL","POO",
+      # Halibut (Greenland + Atlantic)
+      "HAL","GHL",
+      # Solenette / other small soles
+      "SXS","CET",
+      # Other flatfishes / unspecified
+      "FLX","FLO","BUT","RHG"
+    ) |
+    str_detect(sn, "plaice|\\bsole\\b|turbot|brill|\\bdab\\b|flounder|halibut|megrim|witch|limande|cardine|flétan|plie|pliée")
+    ~ "Flatfishes",
+    TRUE ~ NA_character_
+  )
+}
+
+# Ordered factor levels for species groups
+species_group_levels <- c("Cuttlefish","Squid","Mullets","Gurnards",
+                           "Mackerel","Horse mackerel","Whiting",
+                           "Flatfishes","Scallops","Whelk","Shrimps")
+```
+
+```{r helpers-fdi}
+safe_numeric <- function(x, extra_sentinels = character(0)) {
+  base_pat <- "NK|na|N/A|#N/A|CONFID|confidential|BEL|\\."
+  full_pat  <- if (length(extra_sentinels) > 0)
+    paste0("^(", base_pat, "|", paste(extra_sentinels, collapse = "|"), ")$")
+  else
+    paste0("^(", base_pat, ")$")
+  cleaned <- str_trim(x) |>
+    str_replace_all(regex(full_pat, ignore_case = TRUE), NA_character_)
+  val <- suppressWarnings(as.numeric(cleaned))
+  val[!is.na(val) & val == -1] <- NA_real_
+  val
+}
+
+normalise_division <- function(x) {
+  x <- str_trim(x) |> str_to_upper()
+  x <- str_remove(x, "^27\\.")
+  str_replace(x, "^(\\d+)([A-Z])$", "\\1.\\2")
+}
+
+map_gear_fdi <- function(gear_code) {
+  lookup <- c(
+    OTB="Bottom trawl", OTT="Bottom trawl", PTB="Bottom trawl",
+    OTM="Midwater trawl", PTM="Midwater trawl",
+    TBB="Beam trawl",
+    SSC="Scottish seine", SDN="Danish seine",
+    GNS="Gillnet", GND="Gillnet",
+    FPN="Pot/trap", FPO="Pot/trap",
+    LLS="Longline", LLD="Longline",
+    DRB="Dredge",
+    MIS="Other/mixed", NK="Unknown"
+  )
+  dplyr::recode(str_to_upper(str_trim(gear_code)),
+                !!!lookup, .default = "Other/mixed")
+}
+```
+
+<!-- =========================================================
+     DATA LOADING — with cache logic
+     ========================================================= -->
+
+```{r load-aer}
+# Cache: cache_aer.RData — five objects, all pre-filtered to study_divisions_aer:
+#   aer_effort_raw              (wide, one row per stratum)
+#   aer_effort_summary          (aggregated by year/country/gear/sub_reg/vessel_length)
+#   aer_effort_capacity_metric  (adds gt_fishdays_source + gt_fishdays_harmonised)
+#   aer_landings_raw            (wide, one row per stratum × species)
+#   aer_landings_summary        (aggregated by year/country/gear/sub_reg/species)
+#
+# Cache is invalidated when:
+#   (a) the raw AER Excel file is newer than the cache, OR
+#   (b) the cache exists but is missing any of the five expected objects
+#       (handles caches built before an object was added)
+
+aer_raw_mtime   <- file.mtime(aer_file)
+aer_cache_mtime <- if (file.exists(aer_cache)) file.mtime(aer_cache) else as.POSIXct(0)
+
+# Check (b): peek at saved object names without loading into global environment
+aer_required_objects <- c("aer_effort_raw", "aer_effort_summary",
+                           "aer_effort_capacity_metric",
+                           "aer_landings_raw", "aer_landings_summary")
+aer_cache_complete <- if (file.exists(aer_cache)) {
+  all(aer_required_objects %in% load(aer_cache, envir = new.env()))
+} else {
+  FALSE
+}
+
+if (aer_cache_mtime > aer_raw_mtime && aer_cache_complete) {
+
+  msg("AER: loading from cache (", format(aer_cache_mtime, "%Y-%m-%d %H:%M"), ")")
+  load(aer_cache)
+
+} else {
+
+  if (!aer_cache_complete)
+    msg("AER: cache incomplete (missing objects) — rebuilding ...")
+  else
+    msg("AER: cache stale — reading raw Excel file ...")
+
+  aer_effort_sheet <- read_excel(aer_file, sheet = "FS_effort by sub-region ") |>
+    clean_names()
+  msg("AER effort sheet: ", nrow(aer_effort_sheet), " rows, ",
+          ncol(aer_effort_sheet), " columns")
+  msg("  variable_code values: ",
+          paste(sort(unique(aer_effort_sheet$variable_code)), collapse=", "))
+  msg("  sub_reg values (sample): ",
+          paste(head(sort(unique(aer_effort_sheet$sub_reg)), 20), collapse=", "))
+
+  aer_effort_raw <- aer_effort_sheet |>
+    filter(!is.na(variable_code), !is.na(value)) |>
+    mutate(
+      year          = as.integer(year),
+      sub_reg       = str_to_lower(str_trim(sub_reg)),
+      gear_category = map_gear_aer(fishing_tech)
+    ) |>
+    # Filter to study area BEFORE pivot to reduce size
+    filter(sub_reg %in% study_divisions_aer) |>
+    # NOTE: fs_name is intentionally excluded from the pivot keys.
+    # It is a free-text fleet segment label that can differ across rows of the
+    # same stratum, which would create spurious extra rows if included.
+    # year + country_code + sub_reg + fishing_tech + vessel_length + gear_category
+    # form the natural stratum key; values_fn = sum handles any remaining
+    # duplicates within a stratum × variable_code combination.
+    dplyr::select(year, country_code, sub_reg, fishing_tech,
+           vessel_length, gear_category,
+           variable_code, value) |>
+    pivot_wider(names_from = variable_code, values_from = value,
+                values_fn = sum)
+
+  msg("AER effort after pivot (study area): ", nrow(aer_effort_raw), " rows")
+  msg("  Columns: ", paste(names(aer_effort_raw), collapse=", "))
+  msg("  Countries: ", paste(sort(unique(aer_effort_raw$country_code)), collapse=", "))
+  msg("  Year range: ", min(aer_effort_raw$year), "–", max(aer_effort_raw$year))
+
+  aer_landings_sheets <- bind_rows(
+    read_excel(aer_file, sheet = "FS_landings FAO 2008-2012") |> clean_names(),
+    read_excel(aer_file, sheet = "FS_landings FAO 2013-2017") |> clean_names(),
+    read_excel(aer_file, sheet = "FS_landings FAO 2018-2023") |> clean_names()
+  )
+  msg("AER landings sheets combined: ", nrow(aer_landings_sheets), " rows")
+
+  aer_landings_raw <- aer_landings_sheets |>
+    filter(!is.na(variable_code), !is.na(value)) |>
+    mutate(
+      year          = as.integer(year),
+      sub_reg       = str_to_lower(str_trim(sub_reg)),
+      gear_category = map_gear_aer(fishing_tech)
+    ) |>
+    # Filter to study area BEFORE pivot
+    filter(sub_reg %in% study_divisions_aer) |>
+    dplyr::select(year, country_code, sub_reg, fishing_tech,
+           vessel_length, gear_category,
+           species_code, species_name,
+           variable_code, value) |>
+    pivot_wider(names_from = variable_code, values_from = value,
+                values_fn = sum) |>
+    rename(live_weight_kg = totwghtlandg,
+           value_euro     = totvallandg) |>
+    mutate(live_weight_t = live_weight_kg / 1000)
+
+  msg("AER landings after pivot (study area): ", nrow(aer_landings_raw), " rows")
+  msg("  Countries: ", paste(sort(unique(aer_landings_raw$country_code)), collapse=", "))
+
+  # Basic fishing-days summary — retains vessel_length for capacity plot
+  aer_effort_summary <- aer_effort_raw |>
+    group_by(year, country_code, gear_category, sub_reg, vessel_length) |>
+    summarise(
+      across(any_of(c("totfishdays","totseadays","totkwfishdays","totgtfishdays")),
+             ~ sum(.x, na.rm = TRUE)),
+      .groups = "drop"
+    )
+
+  # Capacity-weighted effort: GT-fishing days where available; impute from
+  # kW-fishing days for countries that only report kW (using fleet-average ratio).
+  # A flag column records the source so plots can distinguish imputed values.
+  aer_effort_capacity_metric <- aer_effort_summary |>
+    mutate(
+      gt_fishdays_source = case_when(
+        totgtfishdays > 0             ~ "GT (reported)",
+        totkwfishdays > 0             ~ "GT (imputed from kW)",
+        TRUE                          ~ "Not available"
+      ),
+      gt_fishdays_harmonised = case_when(
+        totgtfishdays > 0             ~ totgtfishdays,
+        totkwfishdays > 0             ~ totkwfishdays * kw_to_gt_ratio,
+        TRUE                          ~ NA_real_
+      )
+    )
+
+  aer_landings_summary <- aer_landings_raw |>
+    group_by(year, country_code, gear_category,
+             sub_reg, species_code, species_name) |>
+    summarise(
+      live_weight_t = sum(live_weight_t, na.rm = TRUE),
+      value_euro    = sum(value_euro,    na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  # Both raw objects are already filtered to study_divisions_aer above,
+  # so the cache contains only study-area rows — no further filtering needed.
+  save(aer_effort_raw, aer_effort_summary, aer_effort_capacity_metric,
+       aer_landings_raw, aer_landings_summary,
+       file = aer_cache)
+  msg("AER: cache saved → ", aer_cache)
+}
+```
+
+```{r load-gfw}
+# Cache: cache_gfw.RData — fishing_days_study, events_classified_fr,
+#                           vessel_meta, fao_sf_division, world
+
+gfw_source_files <- c(
+  file.path(flyshootdir, "gfw_s7_effort.RData"),
+  file.path(flyshootdir, "gfw_s6_zones.RData"),
+  file.path(flyshootdir, "gfw_s3_vessel_meta.RData")
+)
+gfw_raw_mtime   <- max(file.mtime(gfw_source_files), na.rm = TRUE)
+gfw_cache_mtime <- if (file.exists(gfw_cache)) file.mtime(gfw_cache) else as.POSIXct(0)
+
+if (gfw_cache_mtime > gfw_raw_mtime) {
+
+  msg("GFW: loading from cache (", format(gfw_cache_mtime, "%Y-%m-%d %H:%M"), ")")
+  load(gfw_cache)
+
+} else {
+
+  msg("GFW: cache missing or stale — loading pipeline RData files ...")
+
+  fishing_days_study   <- load_object(
+    file.path(flyshootdir, "gfw_s7_effort.RData"), "fishing_days_study")
+  events_classified_fr <- load_object(
+    file.path(flyshootdir, "gfw_s6_zones.RData"), "events_classified_fr")
+  vessel_meta          <- load_object(
+    file.path(flyshootdir, "gfw_s3_vessel_meta.RData"), "vessel_meta")
+
+  world <- ne_countries(scale = "medium", returnclass = "sf")
+
+  fao_sf <- load_object(file.path(spatialdir, "fao_sf.RData"), "fao_sf")
+  fao_sf_division <- fao_sf |>
+    filter(F_LEVEL == "DIVISION") |>
+    dplyr::select(division = F_DIVISION) |>
+    mutate(division = toupper(division)) |>
+    filter(division %in% study_divisions_gfw) |>
+    group_by(division) |>
+    summarise(geometry = st_union(geometry)) |>
+    st_make_valid()
+  rm(fao_sf)
+
+  save(fishing_days_study, events_classified_fr, vessel_meta,
+       fao_sf_division, world,
+       file = gfw_cache)
+  msg("GFW: cache saved → ", gfw_cache)
+}
+```
+
+```{r load-gfw-spatial}
+# Cache: cache_gfw_spatial.RData
+# Stores all expensive computed spatial objects so they survive across knits.
+# Objects saved:
+#   land_study, study_window_proj, study_owin,
+#   world_proj, fao_div_proj,
+#   bbox_7d_proj, window_7d_proj, window_7d_owin,
+#   kde_results      (all-area KDE, all years)
+#   kde_7d           (7D KDE, all years)
+#   cell_effort_7d   (events per 5 km cell per year, 7D)
+#   cell_effort_full (full grid with zeros, 7D)
+#   concentration_7d (Gini + top10 per year, 7D)
+#
+# To force recomputation (e.g. after new GFW data):
+#   file.remove(spatial_cache)
+
+crs_proj    <- 32630
+sigma_all   <- 20000   # KDE bandwidth for all-area map (m)
+sigma_7d    <- 10000   # KDE bandwidth for 7D map (m)
+kde_sample  <- 10000   # events sampled per year for KDE
+cell_size   <- 5000    # grid cell size for concentration (m)
+
+spatial_cache_mtime <- if (file.exists(spatial_cache)) file.mtime(spatial_cache) else as.POSIXct(0)
+gfw_cache_mtime_now <- file.mtime(gfw_cache)   # spatial depends on gfw objects
+
+if (spatial_cache_mtime > gfw_cache_mtime_now) {
+
+  msg("GFW spatial: loading from cache (", format(spatial_cache_mtime, "%Y-%m-%d %H:%M"), ")")
+  load(spatial_cache)
+
+} else {
+
+  msg("GFW spatial: computing spatial objects (this takes a few minutes) ...")
+
+  # ---- Base spatial objects ------------------------------------------------
+  land_study <- world %>%
+    st_crop(st_bbox(c(xmin = xlim[1], xmax = xlim[2],
+                      ymin = ylim[1], ymax = ylim[2]), crs = 4326)) %>%
+    st_union()
+
+  study_window_sf <- fao_sf_division %>%
+    st_union() %>%
+    st_difference(land_study) %>%
+    st_make_valid()
+
+  study_window_proj <- study_window_sf %>% st_transform(crs_proj)
+  study_owin        <- as.owin(study_window_proj)
+  world_proj        <- world           %>% st_transform(crs_proj)
+  fao_div_proj      <- fao_sf_division %>% st_transform(crs_proj)
+
+  # ---- 7D spatial objects --------------------------------------------------
+  bbox_7d <- st_bbox(fao_sf_division %>% filter(division == "27.7.D"))
+  land_7d <- world %>% st_crop(bbox_7d) %>% st_union()
+  window_7d_sf <- fao_sf_division %>%
+    filter(division == "27.7.D") %>%
+    st_difference(land_7d) %>%
+    st_make_valid()
+  window_7d_proj <- window_7d_sf %>% st_transform(crs_proj)
+  window_7d_owin <- as.owin(window_7d_proj)
+  bbox_7d_proj   <- st_bbox(window_7d_proj)
+
+  # ---- KDE — all divisions -------------------------------------------------
+  events_for_kde_proj <- events_classified_fr %>%
+    mutate(year = lubridate::year(start)) %>%
+    filter(year %in% study_years, !is.na(lon), !is.na(lat)) %>%
+    dplyr::select(year, lon, lat) %>%
+    group_by(year) %>%
+    slice_sample(n = kde_sample) %>%
+    ungroup() %>%
+    st_as_sf(coords = c("lon","lat"), crs = 4326) %>%
+    st_transform(crs_proj) %>%
+    mutate(x = st_coordinates(.)[,1], y = st_coordinates(.)[,2]) %>%
+    st_drop_geometry()
+
+  kde_results <- map_dfr(study_years, function(yr) {
+    pts <- events_for_kde_proj %>% filter(year == yr)
+    if (nrow(pts) < 50) return(NULL)
+    ppp_yr <- tryCatch(
+      ppp(x = pts$x, y = pts$y, window = study_owin),
+      error = function(e) NULL)
+    if (is.null(ppp_yr)) return(NULL)
+    kde <- density(ppp_yr, sigma = sigma_all, dimyx = c(200,200), edge = TRUE)
+    as.data.frame(kde) %>%
+      rename(x=x, y=y, density=value) %>%
+      filter(!is.na(density), density > 0) %>%
+      mutate(ndensity = density / max(density), year = yr)
+  })
+
+  # ---- KDE — ICES 27.7.D --------------------------------------------------
+  events_7d_proj <- events_classified_fr %>%
+    mutate(year = lubridate::year(start)) %>%
+    filter(year %in% study_years, division == "27.7.D",
+           !is.na(lon), !is.na(lat)) %>%
+    dplyr::select(year, lon, lat) %>%
+    st_as_sf(coords = c("lon","lat"), crs = 4326) %>%
+    st_transform(crs_proj) %>%
+    mutate(x = st_coordinates(.)[,1], y = st_coordinates(.)[,2]) %>%
+    st_drop_geometry()
+
+  kde_7d <- map_dfr(study_years, function(yr) {
+    pts <- events_7d_proj %>% filter(year == yr)
+    if (nrow(pts) < 50) return(NULL)
+    ppp_yr <- tryCatch(
+      ppp(x = pts$x, y = pts$y, window = window_7d_owin),
+      error = function(e) NULL)
+    if (is.null(ppp_yr)) return(NULL)
+    kde <- density(ppp_yr, sigma = sigma_7d, dimyx = c(200,200), edge = TRUE)
+    as.data.frame(kde) %>%
+      rename(x=x, y=y, density=value) %>%
+      filter(!is.na(density), density > 0) %>%
+      mutate(ndensity = density / max(density), year = yr)
+  })
+
+  # ---- Grid-cell effort — ICES 27.7.D ------------------------------------
+  events_7d_grid <- events_7d_proj %>%
+    mutate(
+      x_cell  = floor(x / cell_size) * cell_size + cell_size / 2,
+      y_cell  = floor(y / cell_size) * cell_size + cell_size / 2,
+      cell_id = paste(x_cell, y_cell, sep = "_"))
+
+  cell_effort_7d <- events_7d_grid %>%
+    group_by(year, cell_id, x_cell, y_cell) %>%
+    summarise(n_events = n(), .groups = "drop")
+
+  # Full grid (including zero-effort cells) for hotspot maps
+  x_range <- seq(floor(min(cell_effort_7d$x_cell)/cell_size)*cell_size,
+                 ceiling(max(cell_effort_7d$x_cell)/cell_size)*cell_size, by=cell_size)
+  y_range <- seq(floor(min(cell_effort_7d$y_cell)/cell_size)*cell_size,
+                 ceiling(max(cell_effort_7d$y_cell)/cell_size)*cell_size, by=cell_size)
+
+  full_grid_sf <- expand_grid(year=study_years, x_cell=x_range, y_cell=y_range) %>%
+    st_as_sf(coords=c("x_cell","y_cell"), crs=crs_proj, remove=FALSE) %>%
+    st_filter(window_7d_proj %>% st_buffer(cell_size/2)) %>%
+    st_drop_geometry()
+
+  cell_effort_full <- full_grid_sf %>%
+    left_join(cell_effort_7d %>% dplyr::select(year,x_cell,y_cell,n_events),
+              by=c("year","x_cell","y_cell")) %>%
+    replace_na(list(n_events=0)) %>%
+    group_by(year) %>%
+    mutate(ndensity = n_events / max(n_events)) %>%
+    ungroup()
+
+  # ---- Concentration metrics -----------------------------------------------
+  concentration_7d <- cell_effort_7d %>%
+    group_by(year) %>%
+    summarise(
+      n_cells      = n(),
+      total_events = sum(n_events),
+      gini         = ineq::Gini(n_events),
+      top10_pct    = {
+        s     <- sort(n_events, decreasing=TRUE)
+        n_top <- max(1L, ceiling(0.10*length(s)))
+        sum(s[seq_len(n_top)]) / sum(s) * 100
+      },
+      .groups = "drop")
+
+  save(land_study, study_window_proj, study_owin,
+       world_proj, fao_div_proj,
+       bbox_7d_proj, window_7d_proj, window_7d_owin,
+       kde_results, kde_7d,
+       cell_effort_7d, cell_effort_full, concentration_7d,
+       file = spatial_cache)
+  msg("GFW spatial: cache saved → ", spatial_cache)
+}
+```
+
+```{r load-fdi, eval=FALSE}
+# FDI: reference only — set eval=TRUE for QA / cross-validation
+# Cache: cache_fdi.RData — fdi_days, fdi_catches
+
+fdi_source_files <- c(
+  file.path(out_dir, "fdi_fishingdays_by_country_sizeclass_gear_division_year.csv"),
+  file.path(out_dir, "fdi_catches_by_country_sizeclass_gear_division_year.csv")
+)
+fdi_raw_mtime   <- max(file.mtime(fdi_source_files), na.rm=TRUE)
+fdi_cache_mtime <- if (file.exists(fdi_cache)) file.mtime(fdi_cache) else as.POSIXct(0)
+
+if (fdi_cache_mtime > fdi_raw_mtime) {
+  msg("FDI: loading from cache")
+  load(fdi_cache)
+} else {
+  msg("FDI: reading CSV summaries ...")
+  fdi_days    <- readr::read_csv(fdi_source_files[1], show_col_types=FALSE)
+  fdi_catches <- readr::read_csv(fdi_source_files[2], show_col_types=FALSE)
+  save(fdi_days, fdi_catches, file=fdi_cache)
+  msg("FDI: cache saved → ", fdi_cache)
+}
+```
+
+```{r load-windfarms}
+# Realised (operational) offshore wind farms overlaid on Figures 12 and 13.
+#
+# Sources:
+#   NL: "vergunde windparken" (licensed wind farms), RVO/PZH -- field `status`
+#       distinguishes "In gebruik" (operational) from "In ontwikkeling" /
+#       "In ontwerp" (under development / in design). Filtered to operational.
+#   UK: "Wind Site Agreements England Wales and NI", The Crown Estate --
+#       field `Inf_Status` == "Active/In Operation" used as the operational
+#       filter; "Under Construction", "Consented" and "Government Support on
+#       Offer" used as the in-development filter.
+#   DE: EXCLUDED. The supplied German shapefile (Planungsstand Januar 2024)
+#       covers the German Bight / Baltic Sea (ETRS89-LAEA coordinates
+#       ~4.02-4.10M E / 3.49-3.59M N), entirely outside the Channel / southern
+#       North Sea study area (27.4.c/7.d/7.e) -- confirmed by bounding-box
+#       comparison and is therefore not relevant to this report.
+#
+# LIMITATION: commissioning-date information is incomplete in both the NL
+# source (6 of 15 operational farms have a recorded year) and unavailable in
+# the UK source (status only, no date field). Windfarms are therefore shown
+# as a STATIC set reflecting current (as of source date) status, identically
+# in Figure 12 (all years combined) and in every year panel of Figure 13.
+# This is a simplification: it does NOT reflect the true historical
+# build-out, under which most of these farms -- and certainly all
+# in-development farms -- were not yet present in the earlier years of the
+# study period (2013 onwards). The caption of both figures notes this
+# explicitly.
+
+windfarm_dir <- file.path(spatialdir, "Windfarms UK_NL")  # <-- SET PATH to folder containing the three shapefiles
+
+uk_windfarms_raw <- st_read(
+  file.path(windfarm_dir,
+            "WindSiteAgreements_EnglandWalesAndNI_TheCrownEstate.shp"),
+  quiet = TRUE) |>
+  st_make_valid() |>
+  mutate(
+    status_tier = case_when(
+      Inf_Status == "Active/In Operation"                          ~ "Operational",
+      Inf_Status %in% c("Under Construction", "Consented",
+                        "Government Support on Offer")             ~ "In development",
+      TRUE ~ NA_character_
+    )
+  ) |>
+  filter(!is.na(status_tier)) |>
+  transmute(name = Name_Prop, country_src = "UK", status_tier)
+
+nl_windfarms_raw <- st_read(
+  file.path(windfarm_dir, "vergunde_windparkenPolygon.shp"),
+  quiet = TRUE) |>
+  st_make_valid() |>
+  mutate(
+    status_tier = case_when(
+      status == "In gebruik"      ~ "Operational",
+      status == "In ontwikkeling" ~ "In development",
+      TRUE ~ NA_character_
+    )
+  ) |>
+  filter(!is.na(status_tier)) |>
+  transmute(name = naam, country_src = "NL", status_tier)
+
+windfarms_operational <- bind_rows(
+  uk_windfarms_raw |> st_transform(4326),
+  nl_windfarms_raw |> st_transform(4326)
+) |>
+  mutate(status_tier = factor(status_tier,
+                              levels = c("Operational", "In development"))) |>
+  st_transform(crs_proj) |>
+  st_intersection(study_window_proj |> st_buffer(0))
+
+# Note: status_tier is retained for reference/QA but not mapped to colour
+# in Figures 12/13 -- the simplified two-colour scheme uses wind_border_colour
+# (defined in load-mpa chunk) for all windfarms regardless of status.
+
+msg("Windfarms (operational + in development, UK+NL): ",
+    nrow(windfarms_operational),
+    " polygons within study window (DE excluded -- outside study area)")
+msg("By status: ")
+print(windfarms_operational |> st_drop_geometry() |> count(status_tier))
+
+
+```
+
+
+
+<!-- =========================================================
+     MPA LOADING
+     ========================================================= -->
+
+```{r load-mpa, cache=TRUE, cache.extra=file.mtime(file.path(spatialdir, "MPA_combined_EU_UK.RData"))}
+# Marine Protected Areas (MPAs) overlaid on Figures 12 and 13.
+#
+# Source: MPA_combined_EU_UK.RData — combined EU (Natura 2000 marine) and
+#   UK MPA polygons. The RData file is ~256 MB because it contains full
+#   high-resolution coastline-snapped vertices. This chunk:
+#   (1) Loads the raw object and inspects it
+#   (2) Simplifies geometry aggressively (dTolerance = 1000 m in the
+#       projected CRS) to reduce vertex count for fast plotting
+#   (3) Clips to the study window
+#   (4) Caches the result so subsequent knits skip the heavy load
+#
+# Run this block once interactively first to check object names:
+#   load(file.path(spatialdir, "MPA_combined_EU_UK.RData"))
+#   ls()   # note the object name(s) — update mpa_obj_name below if needed
+
+mpa_file     <- file.path(spatialdir, "MPA_combined_EU_UK.RData")
+mpa_obj_name <- "MPA_combined_EU_UK"   # <-- UPDATE if ls() shows a different name
+
+mpa_cache_file <- file.path(spatialdir, "MPA_study_simplified.RData")
+
+if (file.exists(mpa_cache_file)) {
+
+  # Fast path: load already-simplified study-area object
+  load(mpa_cache_file)
+  msg("MPA: loaded from simplified cache (", nrow(mpa_study), " polygons)")
+
+} else {
+
+  # Slow path: load raw, inspect, simplify, clip, cache
+  msg("MPA: loading raw RData (~256 MB) -- this may take 30-60 seconds...")
+  env_before <- ls()
+  load(mpa_file)
+  env_after  <- ls()
+  mpa_raw    <- get(setdiff(env_after, c(env_before, "env_before", "env_after"))[1])
+
+  msg("MPA raw object class: ", paste(class(mpa_raw), collapse = ", "))
+  msg("MPA raw rows: ", nrow(mpa_raw))
+  msg("MPA raw CRS: ", st_crs(mpa_raw)$input)
+  msg("MPA columns: ", paste(names(mpa_raw), collapse = ", "))
+
+  # Repair geometry then simplify aggressively.
+  # dTolerance = 1000 m removes sub-kilometre detail unnecessary at report scale.
+  # Adjust down (e.g. 500) if coastal shapes look blocky, up (2000) if still slow.
+  msg("MPA: repairing and simplifying geometry (dTolerance = 1000 m)...")
+  mpa_simplified <- mpa_raw |>
+    st_make_valid() |>
+    st_transform(crs_proj) |>
+    st_simplify(preserveTopology = TRUE, dTolerance = 1000) |>
+    st_make_valid() |>
+    filter(!st_is_empty(geometry))
+
+  msg("MPA simplified rows: ", nrow(mpa_simplified))
+  msg("MPA simplified object size: ",
+      format(object.size(mpa_simplified), units = "MB"))
+
+  # Clip to study window
+  mpa_study <- mpa_simplified |>
+    st_intersection(study_window_proj |> st_buffer(0)) |>
+    filter(!st_is_empty(geometry))
+
+  msg("MPA clipped to study window: ", nrow(mpa_study), " polygons")
+
+  # Cache for subsequent knits
+  save(mpa_study, file = mpa_cache_file)
+  msg("MPA: simplified cache saved to ", mpa_cache_file)
+}
+
+# Colour used for MPA borders in Figures 12 and 13
+mpa_border_colour  <- "#5B6EBF"   # blue-violet — distinct from teal/amber windfarms
+wind_border_colour <- "#D94F3D"   # red-orange — replaces per-status colours for
+                                   # the simplified two-colour scheme requested
+```
+
+<!-- =========================================================
+     DOCUMENT BODY
+     ========================================================= -->
+
+---
+
+# 1. Summary
+
+*[To be written after finalisation of all chapters.]*
+
+Key points to address:
+
+- Trends in total fishing effort in ICES 4.c/7.d/7.e (2008–present) from STECF AER data.
+- Spatial patterns and concentration of effort from GFW data (2013–present).
+- Position of the Vrolijk flyshoot fleet relative to total fleet activity.
+- Stock status, MSC certification and current management concerns.
+- Compliance with the 2024 gentlemen's agreement.
+- Evidence-based sustainability position and key messages.
+
+---
+
+# 2. Introduction
+
+## 2.1 Background
+
+The flyshoot (Danish seine) fishery has come under increasing public and media scrutiny in recent years, including critical coverage in the Netherlands (e.g. Follow the Money). At the same time, 2024 saw a new multilateral gentlemen's agreement on flyshoot fishing in the eastern Channel, and the scallop fishery in the same area received MSC certification. This study brings together available quantitative data and scientific knowledge to provide an objective, evidence-based assessment of the sustainability position of the flyshoot fleet operating in the Channel.
+
+This report was commissioned by Vrolijk and builds directly on the methodology developed in the earlier Flyshoot project, in which Global Fishing Watch (GFW) data and STECF data were used to analyse fleet-level fishing effort trends in the Channel.
+
+## 2.2 Objectives
+
+- To quantify trends in fishing effort and landings in the Channel (2008/2013–present) using official STECF statistics (AER), with spatial distribution characterised using GFW AIS data.
+- To compile a scientifically grounded overview of the fisheries in the Channel, with particular focus on sustainability, ecosystem effects and the positioning of the flyshoot fishery.
+
+## 2.3 Study area and scope
+
+The study covers ICES divisions 27.4.c (southern North Sea), 27.7.d (eastern English Channel) and 27.7.e (western English Channel). The period of analysis is 2008–present for effort and landings trends (AER) and 2013–present for spatial analysis (GFW).
+
+---
+
+# 3. Material & Methods
+
+## 3.1 Literature review approach
+
+The literature review underpinning Sections 4.1 and 4.7 draws on four categories of sources:
+
+**Scientific literature** was identified through targeted searches of Web of Science, Scopus and Google Scholar using the terms: *English Channel fisheries*, *Channel demersal fisheries*, *flyshoot*, *Danish seine Channel*, *beam trawl North Sea Channel*, *scallop Pecten maximus Channel*, *seabed disturbance trawl*, *AIS fishing effort*, and combinations thereof. Priority was given to peer-reviewed articles published since 2010, supplemented by earlier foundational studies where relevant (e.g. Eigaard et al. 2016; Depestele et al. 2016).
+
+**ICES working group reports** were sourced from the ICES library (https://www.ices.dk), primarily:
+
+- *Working Group on Celtic Seas Ecoregion* (WGCSE, ICES 2024a) — principal source for demersal stocks in the Channel (sole, plaice, whiting, sea bass, monkfish, megrim, mullet) and for the broader ecosystem and fisheries context of 27.7.d/e.
+- *Working Group on the Assessment of Demersal Stocks in the North Sea and Skagerrak* (WGNSSK, ICES 2024c) — consulted for stocks with distributions spanning both 27.4.c and the Channel (e.g. plaice, dab, horse mackerel).
+- *Working Group on Widely Distributed Stocks* (WGWIDE, ICES 2024e) — responsible for the assessment of mackerel (*Scomber scombrus*) and horse mackerel (*Trachurus trachurus* western stock), both of which are important flyshoot target species in the Channel.
+- *Working Group on Cephalopod Fisheries and Life History* (WGCEPH, ICES 2024d) — consulted for cuttlefish (*Sepia officinalis*) and squid (*Loligo* spp., *Illex* spp.) in the Channel and North Sea. WGCEPH does not produce formal TAC advice but provides the best available science on stock status and drivers of variability.
+- *Working Group on Ecosystem Effects of Fishing Activities* (WGECO) — for seabed disturbance and ecosystem-level assessments.
+
+ICES advice sheets for the relevant stocks were also consulted directly.
+
+**Official statistics and national sources** include the STECF AER (primary quantitative source for this report), Ifremer fleet and stock assessment reports, the UK Marine Management Organisation (MMO) annual sea fisheries statistics, and the Belgian ILVO annual fleet reports. Where possible, the most recent published edition was used.
+
+**Policy and grey literature** includes EU regulation texts, the UK–EU Trade and Cooperation Agreement fisheries annex, the 2024 gentlemen's agreement between VisNed, Rederscentrale and CNPMEM, and parliamentary reports on post-Brexit fisheries.
+
+All quantitative claims made in the literature sections are cross-referenced with the AER and GFW results presented in Section 4, and discrepancies or gaps are noted where they arise.
+
+## 3.2 STECF AER data (effort and landings trends)
+
+The Annual Economic Report (AER) data were obtained from the STECF 25-07 data release (*EU Fleet Economic and Transversal data, fleet segment level*). The AER provides fishing effort (fishing days, sea days, kW-days, GT-days) and landed weight and value by fleet segment (country × fishing technique × vessel length class), disaggregated by ICES sub-region. Three separate tab-level datasets covering 2008–2012, 2013–2017 and 2018–2023 were concatenated to form a consistent time series.
+
+Effort is expressed as fishing days. GBR is excluded from all AER analyses as no data are available for the UK in the STECF series following Brexit.
+
+## 3.3 GFW data (spatial effort distribution and concentration)
+
+Fishing activity data were retrieved via the Global Fishing Watch (GFW) API (`gfwr` v3.0) using the Events endpoint. Vessel metadata (flag state, gear type, gross tonnage) were obtained from the GFW vessel registry.
+
+Days at sea are defined in this report as vessel-days: for each day, each vessel is assigned to the ICES division in which it spent the majority of its time, based on the spatial distribution of AIS positions recorded during that day. A day is counted as a fishing day if the AIS-derived speed and movement pattern during the majority of that day is classified as active fishing behaviour by the GFW algorithm. This definition differs from the administrative fishing day in the AER (which is based on logbook declarations) and from the simpler presence-day metric. The GFW data are used exclusively for spatial analysis — effort density maps, spatial hotspots, and effort concentration metrics. All computationally expensive spatial objects (KDE grids, gridded effort, concentration metrics) are stored in a dedicated cache file (`cache_gfw_spatial.RData`) to avoid recomputation on each knit.
+
+## 3.4 Offshore wind farm and MPA data (Figures 12-13)
+
+**Offshore wind farms.** Wind farm polygons shown in Figures 12 and 13 are compiled from two national sources: the Crown Estate "Wind Site Agreements" dataset for England, Wales and Northern Ireland, and the Dutch "vergunde windparken" (licensed wind farms) dataset. Both sources distinguish multiple development stages; these are harmonised into two categories: *operational* (UK: `Inf_Status == "Active/In Operation"`; NL: `status == "In gebruik"`) and *in development* (UK: `Under Construction`, `Consented`, or `Government Support on Offer`; NL: `In ontwikkeling`). Sites at the planning or pre-application stage are excluded. A German offshore wind shapefile was obtained but excluded: its spatial coverage is restricted to the German Bight and Baltic Sea, outside the study area.
+
+**Marine Protected Areas.** MPA polygons are drawn from `MPA_combined_EU_UK.RData`, a combined dataset of EU Natura 2000 marine designations and UK MPAs. The raw file is ~256 MB due to high-resolution coastal geometries; these are simplified to a 1 km tolerance (`sf::st_simplify(dTolerance = 1000)` in the projected CRS) before use, which substantially reduces file size and rendering time without visible loss of shape at the report map scale. The simplified object is cached to `MPA_study_simplified.RData` so subsequent knit runs avoid the ~30–60 second load time.
+
+**Colour scheme.** Wind farm boundaries are shown in red-orange; MPA boundaries in blue-violet. Both are unfilled outlines only, drawn over the fishing-event points so they remain visible against any background. Both layers represent current extent and are shown identically in every year panel of Figure 13; see the commissioned-date limitation noted for wind farms above.
+
+**Commissioning dates.** Date information is incomplete in both wind farm sources (see previous version of this section for details). Both wind farm and MPA layers are therefore shown as static current-state overlays in all panels of Figure 13, not as historical reconstructions.
+
+## 3.5 STECF FDI data (reference only)
+
+The STECF FDI dataset was obtained but is not used as a primary analysis source (see table below). The AER provides more complete and consistent country-level data for the same period.
+
+```{r fdi-note-table}
+tibble::tibble(
+  `FDI table` = c("Effort","Landings","Catches","Capacity"),
+  `Key issue` = c(
+    "Substantial confidentiality suppression in key strata",
+    "EU-aggregated only — no country breakdown",
+    "Country-level but with suppressed cells; partial AER overlap",
+    "No division breakdown — national totals only"),
+  `Decision` = rep("Not used", 4)
+) |> knitr::kable(caption = "Table 1. STECF FDI data quality issues and reason for exclusion.")
+```
+
+## 3.6 The 2024 Gentlemen's Agreement
+
+Brief description of the November 2024 multilateral agreement between VisNed (NL), Rederscentrale (BE) and CNPMEM (FR) governing flyshoot fishing in ICES 27.7.d, and its predecessor (April 2021). Key provisions: the 8-sea-day limit per 14-day period, technical gear specifications, and the monitoring obligation. Used as a reference framework for interpreting the fishing effort data in Chapter 4.
+
+---
+
+# 4. Results
+
+## 4.1 Channel fisheries: background and context
+
+This section provides an overview of the Channel fisheries based on the literature reviewed in Section 3.1. A detailed synthesis cross-referenced with the quantitative results of this report is provided in Section 4.8.
+
+### 4.1.1 Geographic scope and management framework
+
+The English Channel (ICES divisions 27.7.d and 27.7.e) is a semi-enclosed sea separating southern England from northern France, with the southern North Sea (27.4.c) forming a contiguous fishing area to the north-east. The Channel supports some of the most intensively exploited fishing grounds in Europe, with nationally important fisheries for France, the United Kingdom, Belgium and the Netherlands, and smaller but significant contributions from Germany (ICES, 2024a; STECF, 2024).
+
+Fisheries management operates primarily through the EU Common Fisheries Policy (CFP) for EU member states, and through the UK–EU Trade and Cooperation Agreement (TCA, 2020) following Brexit. Quota shares, technical measures and access arrangements are reviewed annually through the Specialised Committee on Fisheries established under the TCA (European Commission, 2021; Seafish, 2022).
+
+### 4.1.2 Principal fishing gears and target species
+
+The Channel supports a highly diverse range of fishing gears. Bottom trawl and Danish seine (flyshoot) gears account for the largest share of demersal fishing effort, targeting mixed assemblages of flatfish, cephalopods, small pelagics and roundfish. The French fleet dominates total effort, contributing over 60% of total fishing days in the eastern Channel in most years (ICES, 2024a; Ifremer, 2023). The Dutch flyshoot fleet has expanded significantly since the early 2010s (Quirijns et al., 2020), a trend visible in the AER and GFW series presented in Sections 4.2 and 4.5. Belgian beam trawl effort has declined substantially since the mid-2000s (ILVO, 2022), consistent with the AER landings series in Section 4.3.
+
+Scallop dredging is concentrated in the Baie de Seine (27.7.d) and western Channel (27.7.e), dominated by the French fleet with seasonal UK participation. MSC certification was granted for the Baie de Saint-Brieuc fishery (2022) and the Baie de Seine fishery (November 2024; MSC, 2024). Pot and trap fisheries for whelk, crab and lobster are important to UK coastal communities. Static net fisheries and small-scale handline fisheries are significant for both French and UK inshore fleets but are under-represented in the AER and GFW data due to vessel size and AIS reporting thresholds.
+
+### 4.1.3 Stock status overview
+
+A full species-by-species stock status table is provided in Section 4.8.3 (Table 2), based on the most recent ICES advice cycle (WGCSE 2024a, WGNSSK 2024c, WGWIDE 2024e, WGCEPH 2024d). Key points:
+
+Sole stocks in 27.7.d and 27.7.e are assessed as having fishing mortality above F~MSY~ and biomass below B~pa~, providing the biological explanation for the dramatic decline in flatfish landings visible in Figure 7 (Section 4.3.4). Plaice is in a somewhat better state. Sea bass remains under a recovery plan. Horse mackerel and mackerel are assessed by WGWIDE and are broadly within or close to safe biological limits. Cuttlefish and squid (WGCEPH) have no formal stock assessments or TACs; their management relies on technical measures. Scallops are managed through seasonal access windows and MSC conditions, with the Baie de Seine stock at record biomass levels (Ifremer, 2025) while the western Channel stock is showing signs of decline (MMO, 2023).
+
+---
+
+## 4.2 Effort trends — STECF AER
+
+### 4.1.1 Total fishing days by year, country and gear category
+
+```{r aer-effort-trend, fig.height=6, fig.cap="Figure 1. Total fishing days in ICES 4.c/7.d/7.e per year by country and gear category (AER, 2008–2023). Source: STECF 25-07. Note: GBR data may be absent or incomplete in the AER for post-Brexit years."}
+aer_effort_summary |>
+  filter(country_code %in% report_countries_aer) |>
+  group_by(year, country_code, gear_category) |>
+  summarise(totfishdays = sum(totfishdays, na.rm=TRUE), .groups="drop") |>
+  # Complete so that countries with no data show as gaps rather than being silently absent
+  complete(year, country_code, gear_category, fill=list(totfishdays=NA_real_)) |>
+  mutate(country_code = factor(country_code, levels=report_countries_aer)) |>
+  ggplot(aes(x=year, y=totfishdays, colour=country_code)) +
+  geom_line(na.rm=TRUE) + geom_point(size=1.5, na.rm=TRUE) +
+  scale_colour_manual(values=flag_colours, drop=FALSE, na.value="grey70") +
+  scale_x_continuous(breaks=seq(aer_years_start, 2024, by=2)) +
+  scale_y_continuous(limits=c(0,NA), expand=expansion(mult=c(0,0.05))) +
+  facet_wrap(~gear_category) +
+  labs(title="AER — Fishing days by gear category",
+       subtitle=paste("Divisions:", paste(study_divisions_aer, collapse=" & ")),
+       x="Year", y="Fishing days", colour="Country") +
+  theme_bw() +
+  theme(strip.text=element_text(size=7), axis.text.x=element_text(angle=45, hjust=1),
+        legend.position="bottom")
+```
+
+### 4.1.2 Capacity-weighted effort (GT-fishing days)
+
+Capacity-weighted effort expresses each fishing day weighted by the vessel's gross tonnage (GT), giving a measure of effective fleet capacity deployed. Where GT-fishing days are not reported, they are approximated from kW-fishing days using a fleet-average conversion factor (see Section 3.1). Imputed values are shown with open symbols.
+
+```{r aer-effort-gt-diag, include=FALSE}
+# Diagnostic: which countries report GT vs kW?
+aer_effort_capacity_metric |>
+  filter(country_code %in% report_countries_aer) |>
+  group_by(country_code, gt_fishdays_source) |>
+  summarise(n_rows       = n(),
+            total_metric = sum(gt_fishdays_harmonised, na.rm=TRUE),
+            .groups="drop") |>
+  { function(x) { msg("AER capacity metric coverage:"); print(x) } }()
+```
+
+```{r aer-effort-gt, fig.height=9, fig.cap="Figure 2. Fishing days by country, gear category and vessel length class (AER, 2008–2023). Only Bottom trawl/seine, Beam trawl and Dredge are shown; vessel length classes VL0010 and VL40XX are excluded. Y-axis is free per vessel length class row."}
+exclude_vlc <- c("VL0010","VL40XX","UNKNOWN","NK")
+
+aer_effort_raw |>
+  filter(sub_reg %in% study_divisions_aer,
+         !vessel_length %in% exclude_vlc) |>
+  group_by(year, country_code, gear_category, vessel_length) |>
+  summarise(totfishdays = sum(totfishdays, na.rm=TRUE), .groups="drop") |>
+  filter(gear_category %in% capacity_gears,
+         country_code  %in% report_countries_aer) |>
+  complete(year, country_code, gear_category, vessel_length,
+           fill=list(totfishdays=NA_real_)) |>
+  mutate(country_code = factor(country_code, levels=report_countries_aer)) |>
+  ggplot(aes(x=year, y=totfishdays, colour=country_code, group=country_code)) +
+  geom_line(linewidth=0.7, na.rm=TRUE) +
+  geom_point(size=2, na.rm=TRUE) +
+  scale_colour_manual(values=flag_colours, drop=FALSE, na.value="grey70",
+                      name="Country") +
+  scale_x_continuous(breaks=seq(aer_years_start, 2024, by=2)) +
+  scale_y_continuous(limits=c(0,NA), expand=expansion(mult=c(0,0.05))) +
+  facet_grid(vessel_length ~ gear_category, scales="free_y") +
+  labs(title    = "AER — Fishing days by country, gear and vessel size",
+       subtitle = paste0("Divisions: ", paste(study_divisions_aer, collapse=" & "),
+                         "\nGears: ", paste(capacity_gears, collapse=", ")),
+       x="Year", y="Fishing days") +
+  theme_bw() +
+  theme(strip.text=element_text(size=7),
+        axis.text.x=element_text(angle=45, hjust=1),
+        legend.position="bottom")
+```
+
+### 4.1.3 Seasonal patterns
+
+```{r aer-effort-seasonal, fig.cap="Figure 3. Seasonal distribution of fishing days by gear category (AER)."}
+# TODO: quarterly breakdown where available in AER effort data
+```
+
+---
+
+## 4.2 Landings trends — STECF AER
+
+### 4.2.1 Total landed weight by year, country and gear
+
+```{r aer-landings-total, fig.height=6, fig.cap="Figure 4. Landed weight (t) in ICES 4.c/7.d/7.e per year by country and gear category (AER, 2008–2023). Note: GBR data may be absent or incomplete for post-Brexit years."}
+aer_landings_summary |>
+  filter(country_code %in% report_countries_aer,
+         sub_reg      %in% study_divisions_aer) |>
+  group_by(year, country_code, gear_category) |>
+  summarise(live_weight_t=sum(live_weight_t, na.rm=TRUE), .groups="drop") |>
+  complete(year, country_code, gear_category, fill=list(live_weight_t=NA_real_)) |>
+  mutate(country_code = factor(country_code, levels=report_countries_aer)) |>
+  ggplot(aes(x=year, y=live_weight_t, colour=country_code)) +
+  geom_line(na.rm=TRUE) + geom_point(size=1.5, na.rm=TRUE) +
+  scale_colour_manual(values=flag_colours, drop=FALSE, na.value="grey70",
+                      name="Country") +
+  scale_x_continuous(breaks=seq(aer_years_start, 2024, by=2)) +
+  scale_y_continuous(limits=c(0,NA), expand=expansion(mult=c(0,0.05))) +
+  facet_wrap(~gear_category) +
+  labs(title="AER — Landed weight by gear category",
+       subtitle=paste("Divisions:", paste(study_divisions_aer, collapse=" & ")),
+       x="Year", y="Landed weight (t)") +
+  theme_bw() +
+  theme(strip.text=element_text(size=7), axis.text.x=element_text(angle=45, hjust=1),
+        legend.position="bottom")
+```
+
+### 4.2.2 Key species groups — landings by country
+
+```{r aer-landings-species-country, fig.width=10, fig.height=7, fig.cap="Figure 5. Landings by key species group and country for selected gears (AER, 2008–2023). Bars show stacked country contributions per year. Study area: ICES 4.c/7.d/7.e. Note: GBR data may be absent or incomplete in the AER for post-Brexit years."}
+aer_landings_summary |>
+  filter(country_code %in% report_countries_aer,
+         sub_reg      %in% study_divisions_aer,
+         gear_category %in% capacity_gears,
+         year < 2024) |>
+  mutate(species_group = assign_species_group(species_code, species_name)) |>
+  filter(!is.na(species_group)) |>
+  group_by(year, country_code, species_group) |>
+  summarise(live_weight_t=sum(live_weight_t, na.rm=TRUE), .groups="drop") |>
+  complete(year, country_code, species_group, fill=list(live_weight_t=0)) |>
+  mutate(country_code  = factor(country_code, levels=report_countries_aer),
+         species_group = factor(species_group, levels=species_group_levels)) |>
+  ggplot(aes(x=year, y=live_weight_t, fill=country_code)) +
+  geom_col(position="stack", width=0.8) +
+  scale_fill_manual(values=flag_colours, drop=FALSE, na.value="grey70",
+                    name="Country") +
+  scale_x_continuous(breaks=seq(aer_years_start, 2024, by=2)) +
+  scale_y_continuous(limits=c(0,NA), expand=expansion(mult=c(0,0.05))) +
+  facet_wrap(~species_group, nrow=3) +
+  labs(title    = "AER — Landings by key species group and country",
+       subtitle = paste0("Divisions: ", paste(study_divisions_aer, collapse=" & "),
+                         "  —  Gears: ", paste(capacity_gears, collapse=", ")),
+       caption  = "Countries stacked additively",
+       x="Year", y="Landed weight (t)") +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=45, hjust=1),
+        strip.text=element_text(size=7), legend.position="bottom")
+```
+
+### 4.2.3 Key species groups — landings by gear category
+
+```{r aer-landings-species-gear, fig.width=10, fig.height=7, fig.cap="Figure 6. Landings by key species group and gear category in ICES 4.c/7.d/7.e (AER, 2008–2023). Only selected gears shown. Bars show stacked gear contributions per year across DEU, NLD, BEL, FRA and GBR combined."}
+aer_landings_summary |>
+  filter(country_code %in% report_countries_aer,
+         sub_reg      %in% study_divisions_aer,
+         gear_category %in% capacity_gears,
+         year < 2024) |>
+  mutate(species_group = assign_species_group(species_code, species_name)) |>
+  filter(!is.na(species_group)) |>
+  group_by(year, gear_category, species_group) |>
+  summarise(live_weight_t=sum(live_weight_t, na.rm=TRUE), .groups="drop") |>
+  complete(year, gear_category, species_group, fill=list(live_weight_t=0)) |>
+  mutate(species_group = factor(species_group, levels=species_group_levels)) |>
+  ggplot(aes(x=year, y=live_weight_t, fill=gear_category)) +
+  geom_col(position="stack", width=0.8) +
+  scale_fill_brewer(palette="Set2") +
+  scale_x_continuous(breaks=seq(aer_years_start, 2024, by=2)) +
+  scale_y_continuous(limits=c(0,NA), expand=expansion(mult=c(0,0.05))) +
+  facet_wrap(~species_group, nrow=3) +
+  labs(title   = "AER — Landings by key species group and gear category",
+       subtitle = paste0("Divisions: ", paste(study_divisions_aer, collapse=" & "),
+                         "  —  Gears: ", paste(capacity_gears, collapse=", ")),
+       caption  = "All reporting countries combined",
+       x="Year", y="Landed weight (t)", fill="Gear category") +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=45, hjust=1),
+        strip.text=element_text(size=7), legend.position="bottom")
+```
+
+### 4.2.4 Focal species × focal gears
+
+The following figure focuses on the species and gear combinations most relevant to the flyshoot and associated fisheries: cuttlefish, squid, gurnards, mullets, flatfishes and scallops, caught by bottom trawl/seine, beam trawl, dredge, pot/trap and gillnet.
+
+```{r aer-landings-focal-diag, include=FALSE}
+# Show all distinct species_code + species_name present in the AER landings data
+# for the study area — use this to identify the correct codes for flatfishes
+aer_species_lookup <- aer_landings_summary |>
+  filter(country_code %in% report_countries_aer,
+         sub_reg      %in% study_divisions_aer) |>
+  mutate(species_group = assign_species_group(species_code, species_name)) |>
+  group_by(species_code, species_name, species_group) |>
+  summarise(total_t = sum(live_weight_t, na.rm=TRUE), .groups="drop") |>
+  arrange(desc(total_t))
+
+msg("=== Top 40 species in AER (study area) by total landings ===")
+print(aer_species_lookup |> head(40), n=40)
+
+msg("=== Species assigned NA (not matched by any group) ===")
+print(aer_species_lookup |> filter(is.na(species_group)) |> head(30), n=30)
+
+msg("=== Species currently assigned to Flatfishes ===")
+print(aer_species_lookup |> filter(species_group == "Flatfishes"), n=40)
+```
+
+```{r aer-landings-focal, fig.width=11, fig.height=8, fig.cap="Figure 7. Landings of focal species by focal gear category in ICES 4.c/7.d/7.e (AER, 2008–2023). Each panel shows one species group; colours represent gear categories. Shared y-axis across all panels."}
+focal_species <- c("Cuttlefish","Squid","Gurnards","Mullets","Flatfishes","Scallops","Shrimps")
+
+# Build plot data — do NOT use complete() on all year × gear × species combinations
+# as this creates blank panels when no rows are matched for a species group.
+# Instead complete only within each species_group that has at least one data row.
+focal_data <- aer_landings_summary |>
+  filter(country_code %in% report_countries_aer,
+         sub_reg      %in% study_divisions_aer,
+         year < 2024) |>
+  mutate(species_group = assign_species_group(species_code, species_name)) |>
+  filter(!is.na(species_group), species_group %in% focal_species,
+         gear_category %in% focal_gears_full) |>
+  group_by(year, gear_category, species_group) |>
+  summarise(live_weight_t=sum(live_weight_t, na.rm=TRUE), .groups="drop")
+
+# Only complete within species groups that actually appear in the data
+observed_species <- unique(focal_data$species_group)
+
+focal_plot_data <- focal_data |>
+  group_by(species_group) |>
+  tidyr::complete(year=seq(aer_years_start, 2023),
+                  gear_category=focal_gears_full,
+                  fill=list(live_weight_t=0)) |>
+  ungroup() |>
+  mutate(species_group = factor(species_group, levels=focal_species))
+
+focal_plot_data |>
+  ggplot(aes(x=year, y=live_weight_t, fill=gear_category)) +
+  geom_col(position="stack", width=0.8) +
+  scale_fill_brewer(palette="Set2") +
+  scale_x_continuous(breaks=seq(aer_years_start, 2024, by=2)) +
+  scale_y_continuous(limits=c(0,NA), expand=expansion(mult=c(0,0.05))) +
+  facet_wrap(~species_group, nrow=2) +
+  labs(title    = "AER — Focal species landings by gear category",
+       subtitle = paste0("Divisions: ", paste(study_divisions_aer, collapse=" & "),
+                         "  —  ", paste(report_countries_aer, collapse=", ")),
+       caption  = "All focal gears shown. Shared y-axis.",
+       x="Year", y="Landed weight (t)", fill="Gear category") +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=45, hjust=1),
+        strip.text=element_text(size=8), legend.position="bottom")
+```
+
+Figure 7 reveals several striking patterns in the landing trends for focal species groups in the Channel fisheries.
+
+**Flatfishes** show by far the most dramatic trend in the dataset. Total landings declined from approximately 40,000 t/yr around 2008–2014 to around 10,000 t by 2023 — a roughly 75% reduction over 15 years. This decline is almost entirely driven by beam trawl landings (green), which dominated the flatfish catch throughout the period. Bottom trawl/seine contributes a smaller, relatively stable share. This trajectory mirrors the well-documented contraction of the Belgian and Dutch beam trawl fleets in the Channel under combined pressure from fuel costs, quota restrictions and declining sole and plaice stocks in 27.7.d/e (Depestele et al., 2016; ICES, 2024a; ILVO, 2022). The scale of the decline — visible here across the full fleet for the first time in a single figure — underscores the structural transformation of the Channel demersal fishery over this period.
+
+**Scallops** show the opposite trend: large absolute tonnage (15,000–35,000 t/yr) with a clear upward trajectory since around 2016. The fishery is dominated by dredge gear (purple), with a secondary contribution from bottom trawl/seine (orange). The recent peak in 2022–2023 is consistent with the record 2024–2025 scallop season reported by Ifremer (2025). The growing importance of scallops relative to flatfishes is arguably the defining commercial shift in the Channel fishery over this period.
+
+**Cuttlefish** landings are relatively stable at 5,000–8,000 t/yr, delivered almost entirely by bottom trawl/seine. Some interannual variability is evident, typical of cephalopod populations whose recruitment is sensitive to environmental conditions.
+
+**Squid** follows a similar gear profile to cuttlefish (bottom trawl/seine dominated) but at lower tonnage (~2,000–5,000 t/yr), with a slight declining tendency since the mid-2010s.
+
+**Gurnards** are caught predominantly by beam trawl with a secondary bottom trawl/seine component, at relatively stable landings of ~5,000 t/yr. Given the strong decline in beam trawl effort visible in Figure 1, the stability of gurnard landings may reflect increasing catch rates (CPUE) or a shift towards this low-value bycatch species as target species decline.
+
+**Mullets** show very low tonnage throughout, delivered by bottom trawl/seine only, consistent with their coastal distribution and the predominance of gillnet fisheries for this species that are not captured in the AER at this level.
+
+
+
+```{r aer-landings-top-species, fig.height=5, fig.cap="Figure 8. Top 15 species by total landed weight for selected gears in ICES 4.c/7.d/7.e across DEU, NLD, BEL, FRA and GBR (AER, 2008–2023)."}
+aer_landings_summary |>
+  filter(country_code %in% report_countries_aer,
+         sub_reg      %in% study_divisions_aer,
+         gear_category %in% capacity_gears) |>
+  group_by(species_code, species_name) |>
+  summarise(total_t=sum(live_weight_t, na.rm=TRUE), .groups="drop") |>
+  slice_max(total_t, n=15) |>
+  mutate(species_label = paste0(species_name," (",species_code,")"),
+         species_label = fct_reorder(species_label, total_t)) |>
+  ggplot(aes(x=total_t/1000, y=species_label)) +
+  geom_col(fill="#4E79A7") +
+  scale_x_continuous(limits=c(0,NA), expand=expansion(mult=c(0,0.03))) +
+  labs(title    = "AER — Top 15 species by total landed weight",
+       subtitle = paste0("Divisions: ", paste(study_divisions_aer, collapse=" & "),
+                         "  —  Gears: ", paste(capacity_gears, collapse=", "),
+                         "  —  2008–2023"),
+       x="Total landed weight (1000 t)", y="") +
+  theme_bw()
+```
+
+---
+
+## 4.3 Fleet composition by country and gear type — STECF AER
+
+---
+
+## 4.4 GFW effort — total fishing days and comparison with AER
+
+### 4.4.1 Total GFW fishing days by year and flag state
+
+```{r gfw-plot-flag-total, fig.cap="Figure 10. Total GFW fishing days per year by flag state (all divisions, 2013–2025)."}
+fishing_days_study %>%
+  filter(year %in% study_years) %>%
+  mutate(vessel_flag = if_else(vessel_flag %in% report_countries_gfw,
+                               vessel_flag, "Other")) %>%
+  group_by(year, vessel_flag) %>%
+  summarise(fishing_days=sum(fishing_days), .groups="drop") %>%
+  mutate(vessel_flag = factor(vessel_flag,
+                               levels=c(report_countries_gfw, "Other"))) %>%
+  ggplot(aes(x=year, y=fishing_days, fill=vessel_flag)) +
+  theme_bw() + geom_col() +
+  scale_fill_manual(values=c(flag_colours, Other="#BAB0AC"),
+                    drop=FALSE, na.value="grey70") +
+  scale_x_continuous(breaks=study_years) +
+  scale_y_continuous(limits=c(0,NA), expand=expansion(mult=c(0,0.05))) +
+  theme(axis.text.x=element_text(angle=90, vjust=0.5),
+        legend.position="bottom") +
+  labs(x="", y="Fishing days", fill="Flag",
+       title="GFW — Fishing days by year and flag state")
+```
+
+### 4.4.2 AER vs GFW effort comparison
+
+The two data sources measure effort differently — AER reports administrative fishing days declared by member states; GFW estimates fishing days from AIS vessel-tracking. The comparison below shows total fishing days over the overlapping period 2013–2023. Note that the AER series excludes GBR (post-Brexit data are not consistently included in the STECF AER) while the GFW series includes all five countries.
+
+Several factors can explain systematic differences between the two series:
+
+- **Method for counting fishing days**: AER records one fishing day as any day on which a vessel is registered as fishing by its flag state; GFW counts a vessel-day as active when AIS-derived speed and movement patterns are classified as fishing behaviour. The two methods can disagree for the same vessel on the same day.
+- **AIS coverage and adoption**: AIS was gradually mandated across the EU fleet between 2008 and 2014. Early years of the GFW series therefore under-represent vessels that did not yet carry AIS transponders, leading to lower GFW effort estimates before ~2014.
+- **Small coastal vessels**: Vessels below ~15 m LOA are not required to carry AIS in many jurisdictions. This segment is captured in the AER (via logbook reporting) but largely absent from GFW, causing a structural undercount in GFW relative to AER for gears dominated by small vessels (e.g. pot/trap, gillnet).
+- **Gear type assignment**: GFW classifies gear from AIS movement patterns; misclassification can shift effort between gear categories when comparing with AER gear-specific totals.
+- **Spatial attribution**: AER effort is attributed to the ICES division declared in the logbook; GFW effort is attributed to the GPS position of the fishing event. In boundary areas the two can differ.
+
+```{r aer-gfw-comparison, fig.height=5, fig.cap="Figure 11. Comparison of total fishing days from AER (DEU+NLD+BEL+FRA) and GFW (DEU+NLD+BEL+FRA+GBR), 2013–2023. ICES 4.c/7.d/7.e. GBR is included in GFW but excluded from AER due to incomplete post-Brexit reporting in STECF."}
+# AER: DEU+NLD+BEL+FRA only (GBR excluded — incomplete in AER post-Brexit)
+aer_countries_comparison <- c("DEU","NLD","BEL","FRA")
+aer_label <- paste0("AER (", paste(aer_countries_comparison, collapse="+"), ")")
+gfw_label <- paste0("GFW (", paste(report_countries_gfw, collapse="+"), ")")
+
+aer_total <- aer_effort_summary |>
+  filter(country_code %in% aer_countries_comparison,
+         sub_reg      %in% study_divisions_aer,
+         year %in% intersect(study_years, seq(aer_years_start, 2023))) |>
+  group_by(year) |>
+  summarise(fishing_days=sum(totfishdays, na.rm=TRUE), .groups="drop") |>
+  mutate(source=aer_label)
+
+gfw_total <- fishing_days_study %>%
+  filter(vessel_flag %in% report_countries_gfw,
+         year %in% intersect(study_years, seq(aer_years_start, 2023))) %>%
+  group_by(year) %>%
+  summarise(fishing_days=sum(fishing_days), .groups="drop") %>%
+  mutate(source=gfw_label)
+
+bind_rows(aer_total, gfw_total) |>
+  ggplot(aes(x=year, y=fishing_days/1000, colour=source, shape=source)) +
+  geom_line(linewidth=1) + geom_point(size=2.5) +
+  scale_x_continuous(breaks=seq(2013, 2023, by=1)) +
+  scale_y_continuous(limits=c(0,NA), expand=expansion(mult=c(0,0.05))) +
+  scale_colour_manual(values=setNames(c("#E15759","#4E79A7"), c(aer_label, gfw_label))) +
+  scale_shape_manual(values=setNames(c(16L, 17L), c(aer_label, gfw_label))) +
+  labs(title    = "Effort comparison: AER vs GFW",
+       subtitle = paste0("Divisions: ", paste(study_divisions_aer, collapse=" & ")),
+       x="Year", y="Fishing days (1000)", colour="Source", shape="Source") +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=45, hjust=1), legend.position="bottom")
+```
+
+---
+
+## 4.5 GFW effort — spatial distribution
+
+### 4.5.1 Spatial distribution of fishing events
+
+```{r gfw-plot-spatial-all, fig.height=6, fig.cap="Figure 12. Spatial distribution of GFW fishing events (random sample of 20,000), all years combined, coloured by flag state. Red-orange outlines: offshore wind farms (operational + in development, UK and NL; see Section 3.4). Blue-violet outlines: Marine Protected Areas (EU Natura 2000 marine + UK MPAs; see Section 3.4). Both layers shown at current extent; historical build-out not reconstructed. Country coastlines and ICES division boundaries shown."}
+sample_size <- 20000
+events_sample <- events_classified_fr %>%
+  dplyr::select(-any_of(c("vessel_flag","vessel_name"))) %>%
+  left_join(vessel_meta %>% dplyr::select(vesselId, vessel_flag), by="vesselId") %>%
+  mutate(vessel_flag = if_else(vessel_flag %in% report_countries_gfw,
+                               vessel_flag, "Other"),
+         vessel_flag = factor(vessel_flag,
+                               levels=c(report_countries_gfw, "Other"))) %>%
+  slice_sample(n=sample_size) %>%
+  st_as_sf(coords=c("lon","lat"), crs=4326) %>%
+  st_transform(crs_proj) %>%
+  mutate(x=st_coordinates(.)[,1], y=st_coordinates(.)[,2]) %>%
+  st_drop_geometry()
+
+ggplot() +
+  theme_bw() +
+  geom_point(data=events_sample,
+             aes(x=x, y=y, colour=vessel_flag),
+             size=0.4, alpha=0.7) +
+  geom_sf(data=world_proj, fill="grey85", colour="grey50", linewidth=0.3) +
+  geom_sf(data=fao_div_proj, fill=NA, colour="black", linewidth=0.5) +
+  geom_sf_label(data=fao_div_proj,
+                aes(label=division), size=2.5, colour="black",
+                fill=alpha("white", 0.6), label.size=0) +
+  scale_colour_manual(values=c(flag_colours, Other="#BAB0AC"),
+                      drop=FALSE, na.value="grey70", name="Flag") +
+  geom_sf(data=windfarms_operational,
+          fill=NA, colour=wind_border_colour, linewidth=0.5) +
+  geom_sf(data=mpa_study,
+          fill=NA, colour=mpa_border_colour, linewidth=0.35, alpha=0.8) +
+  annotate("text", x=-Inf, y=-Inf, hjust=-0.1, vjust=-0.5, size=2.5,
+           label=paste0("Wind farms: ",
+                        wind_border_colour |> toupper(),
+                        "  |  MPAs: ", mpa_border_colour |> toupper())) +
+  coord_sf(crs=crs_proj,
+           xlim=st_bbox(study_window_proj)[c("xmin","xmax")],
+           ylim=st_bbox(study_window_proj)[c("ymin","ymax")],
+           expand=TRUE) +
+  guides(colour=guide_legend(override.aes=list(size=3, alpha=1))) +
+  theme(axis.text=element_blank(), axis.ticks=element_blank(),
+        axis.title=element_blank(), legend.position="bottom") +
+  labs(title=paste0("GFW fishing events — all years (sample of ", sample_size, ")"),
+       subtitle="ICES 27.4.C / 27.7.D / 27.7.E  |  Red-orange = wind farms  |  Blue-violet = MPAs")
+```
+
+### 4.5.2 Spatial distribution of fishing events by year
+
+```{r gfw-plot-spatial-by-year, fig.height=12, fig.cap="Figure 13. Spatial distribution of GFW fishing events by year (random sample of 10,000 per year), coloured by flag state. Red-orange outlines: offshore wind farms (UK+NL, operational + in development). Blue-violet outlines: Marine Protected Areas (EU+UK). Both layers shown at current extent identically across all year panels; see Section 3.4 for data limitations. Country coastlines and ICES division boundaries shown."}
+sample_size_yr <- 10000
+events_sample_yr <- events_classified_fr %>%
+  dplyr::select(-any_of(c("vessel_flag","vessel_name"))) %>%
+  left_join(vessel_meta %>% dplyr::select(vesselId, vessel_flag), by="vesselId") %>%
+  mutate(year       = lubridate::year(start),
+         vessel_flag = if_else(vessel_flag %in% report_countries_gfw,
+                               vessel_flag, "Other"),
+         vessel_flag = factor(vessel_flag,
+                               levels=c(report_countries_gfw, "Other"))) %>%
+  filter(year %in% study_years) %>%
+  group_by(year) %>%
+  slice_sample(n=sample_size_yr) %>%
+  ungroup() %>%
+  st_as_sf(coords=c("lon","lat"), crs=4326) %>%
+  st_transform(crs_proj) %>%
+  mutate(x=st_coordinates(.)[,1], y=st_coordinates(.)[,2]) %>%
+  st_drop_geometry()
+
+ggplot() +
+  theme_bw() +
+  geom_point(data=events_sample_yr,
+             aes(x=x, y=y, colour=vessel_flag),
+             size=0.3, alpha=0.7) +
+  geom_sf(data=world_proj, fill="grey85", colour="grey50", linewidth=0.3) +
+  geom_sf(data=fao_div_proj, fill=NA, colour="black", linewidth=0.4) +
+  scale_colour_manual(values=c(flag_colours, Other="#BAB0AC"),
+                      drop=FALSE, na.value="grey70", name="Flag") +
+  geom_sf(data=windfarms_operational,
+          fill=NA, colour=wind_border_colour, linewidth=0.5) +
+  geom_sf(data=mpa_study,
+          fill=NA, colour=mpa_border_colour, linewidth=0.3, alpha=0.8) +
+  coord_sf(crs=crs_proj,
+           xlim=st_bbox(study_window_proj)[c("xmin","xmax")],
+           ylim=st_bbox(study_window_proj)[c("ymin","ymax")],
+           expand=TRUE) +
+  guides(colour=guide_legend(override.aes=list(size=3, alpha=1))) +
+  theme(axis.text=element_blank(), axis.ticks=element_blank(),
+        axis.title=element_blank(), legend.position="bottom",
+        strip.background=element_rect(fill="grey90"),
+        strip.text=element_text(face="bold", size=8)) +
+  labs(title=paste0("GFW fishing events by year (sample of ", sample_size_yr, " per year)"),
+       subtitle="ICES 27.4.C / 27.7.D / 27.7.E  |  Red-orange = wind farms  |  Blue-violet = MPAs  |  Both layers: current extent, static across years") +
+  facet_wrap(~year, ncol=3)
+```
+
+### 4.5.3 Kernel density — all divisions
+
+Kernel density estimation (KDE) converts the discrete set of fishing event locations into a continuous surface representing the spatial intensity of fishing effort. For each year, fishing event coordinates are projected into a metric coordinate system (UTM zone 30N) and a Gaussian kernel with bandwidth σ = `r sigma_all/1000` km is applied within the study area boundary (land excluded). The resulting density surface is normalised within each year to a 0–1 scale, where 1 represents the grid cell with the highest density and 0 the lowest. This within-year normalisation makes annual maps directly comparable in terms of spatial pattern, but means that absolute effort levels cannot be compared between years — a year with low total effort and a year with high total effort will both have cells reaching 1.0. For absolute effort comparisons, refer to Figures 10 and 11.
+
+```{r gfw-plot-kde, fig.height=10, fig.cap="Figure 14. Kernel density of GFW fishing effort for all fleets combined, faceted by year. Bandwidth σ = 20 km. Density normalised within each year (0 = low, 1 = high)."}
+ggplot() +
+  theme_bw() +
+  geom_tile(data=kde_results, aes(x=x, y=y, fill=ndensity)) +
+  scale_fill_viridis_c(option="inferno", name="Relative\ndensity",
+                       limits=c(0,1), breaks=c(0,0.5,1),
+                       labels=c("Low","Mid","High"), na.value="transparent") +
+  geom_sf(data=world_proj, fill="grey85", colour="grey60", linewidth=0.2) +
+  geom_sf(data=fao_div_proj, fill=NA, colour="grey30", linewidth=0.4) +
+  coord_sf(crs=crs_proj,
+           xlim=st_bbox(study_window_proj)[c("xmin","xmax")],
+           ylim=st_bbox(study_window_proj)[c("ymin","ymax")],
+           expand=TRUE) +
+  theme(axis.text=element_blank(), axis.ticks=element_blank(),
+        axis.title=element_blank(), legend.position="bottom",
+        strip.background=element_rect(fill="grey90"),
+        strip.text=element_text(face="bold", colour="grey20")) +
+  labs(title=paste0("GFW — Fishing effort density, all fleets (σ = ", sigma_all/1000, " km)"),
+       subtitle="Normalised per year  —  Land excluded") +
+  facet_wrap(~year, ncol=4)
+```
+
+Figure 14 shows the spatial distribution of fishing effort across the three study divisions (27.4.c, 27.7.d, 27.7.e) for all flag states combined. The broad pattern is consistent across years: effort is concentrated in the eastern Channel (27.7.d) and the southern North Sea (27.4.c), with lower but persistent effort in the western Channel (27.7.e). The area off the Pas de Calais and around the Baie de Seine emerges as the most persistently fished sub-area in 27.7.d. Effort in 27.4.c is concentrated along the southern fringe of the North Sea, consistent with the beam trawl and bottom trawl grounds historically fished by Dutch and Belgian vessels.
+
+### 4.5.4 Kernel density — ICES 27.7.D
+
+The 27.7.D panel uses a narrower bandwidth (σ = `r sigma_7d/1000` km) to resolve finer-scale spatial structure within the eastern Channel. The same normalisation approach applies. The restricted study window (ICES 27.7.D only, land excluded) ensures the KDE is not influenced by effort in adjacent divisions.
+
+```{r gfw-plot-kde-7d, fig.height=10, fig.cap="Figure 15. Kernel density of GFW fishing effort in ICES 27.7.D, faceted by year. Bandwidth σ = 10 km. Density normalised within each year."}
+ggplot() +
+  theme_bw() +
+  geom_tile(data=kde_7d, aes(x=x, y=y, fill=ndensity)) +
+  scale_fill_viridis_c(option="inferno", name="Relative\ndensity",
+                       limits=c(0,1), na.value="transparent") +
+  geom_sf(data=world_proj, fill="grey40", colour="grey60", linewidth=0.2) +
+  geom_sf(data=fao_div_proj %>% filter(division=="27.7.D"),
+          fill=NA, colour="white", linewidth=0.5) +
+  coord_sf(crs=crs_proj,
+           xlim=bbox_7d_proj[c("xmin","xmax")],
+           ylim=bbox_7d_proj[c("ymin","ymax")],
+           expand=TRUE) +
+  theme(axis.text=element_blank(), axis.ticks=element_blank(),
+        axis.title=element_blank(), legend.position="bottom",
+        strip.background=element_rect(fill="grey90"),
+        strip.text=element_text(face="bold", colour="grey20")) +
+  labs(title=paste0("GFW — Fishing effort density ICES 27.7.D (σ = ", sigma_7d/1000, " km)"),
+       subtitle="Normalised per year  —  Land excluded") +
+  facet_wrap(~year, ncol=4)
+```
+
+Figure 15 reveals consistent hotspots in 27.7.D across the study period: the Baie de Seine and the area off Cap Gris-Nez/Calais in the north-east of the division are the most persistently fished zones. A secondary concentration is visible in the mid-Channel. The post-2021 period (post-Brexit) shows a subtle southward shift in the density peak, consistent with reduced access to UK waters in the northern half of 27.7.D and concentration of effort in French EEZ waters. This pattern is quantified further by the concentration metrics in Section 4.6.
+
+
+
+---
+
+## 4.6 GFW effort — spatial concentration (ICES 27.7.D)
+
+### 4.6.1 Gini coefficient and top-10% cell share
+
+Two complementary metrics are used to quantify the spatial concentration of fishing effort across the `r cell_size/1000` km × `r cell_size/1000` km grid cells covering ICES 27.7.D.
+
+The **Gini coefficient** is a standard inequality measure borrowed from economics, adapted here to quantify the unevenness of effort across grid cells. It ranges from 0 to 1: a value of 0 means fishing effort is spread perfectly uniformly across all cells; a value of 1 means all effort is concentrated in a single cell. In practice, fishing effort is always somewhat concentrated — values above 0.7 indicate strong spatial concentration in a small number of areas, while values below 0.5 suggest a relatively dispersed fleet. A rising Gini over time indicates that the fleet is progressively concentrating in fewer locations.
+
+The **top-10% cell share** is a more intuitive companion metric: it asks what percentage of the total annual fishing events falls within the 10% of grid cells that were most intensively fished that year. If effort were uniform, this would be exactly 10%. In practice values of 40–70% are common in concentrated fisheries, meaning that a small fraction of the available sea area absorbs the majority of fishing pressure. Together, the two metrics capture different aspects of spatial concentration: the Gini summarises the full distribution of effort, while the top-10% share focuses specifically on the most intensively exploited areas.
+
+```{r gfw-plot-concentration, fig.height=4, fig.cap="Figure 16. Spatial concentration of fishing effort in ICES 27.7.D: Gini coefficient (left) and percentage of total effort in the top-10% most-fished 5 km grid cells (right), 2013–2025. The Gini coefficient ranges from 0 (perfectly uniform effort) to 1 (all effort in one cell). The top-10% share shows what fraction of total annual events falls within the 10% of cells with highest effort."}
+p_gini <- ggplot(concentration_7d, aes(x=year, y=gini)) +
+  theme_bw() +
+  geom_line(colour="#E15759", linewidth=1) + geom_point(colour="#E15759", size=3) +
+  geom_text(aes(label=round(gini,3)), vjust=-0.8, size=2.8) +
+  scale_x_continuous(breaks=study_years) +
+  scale_y_continuous(limits=c(0,1), labels=scales::number_format(accuracy=0.01)) +
+  theme(axis.text.x=element_text(angle=90, vjust=0.5)) +
+  labs(x="", y="Gini coefficient", title="Gini coefficient")
+
+p_top10 <- ggplot(concentration_7d, aes(x=year, y=top10_pct)) +
+  theme_bw() +
+  geom_line(colour="#4E79A7", linewidth=1) + geom_point(colour="#4E79A7", size=3) +
+  geom_text(aes(label=paste0(round(top10_pct,1),"%")), vjust=-0.8, size=2.8) +
+  scale_x_continuous(breaks=study_years) +
+  scale_y_continuous(limits=c(0,NA), expand=expansion(mult=c(0,0.15)),
+                     labels=scales::percent_format(scale=1)) +
+  theme(axis.text.x=element_text(angle=90, vjust=0.5)) +
+  labs(x="", y="% of total effort", title="Top-10% cell share")
+
+p_gini + p_top10 +
+  plot_annotation(
+    title    = paste0("GFW — Effort concentration ICES 27.7.D  —  ",
+                      cell_size/1000, " km grid  —  All fleets"),
+    subtitle = "Left: Gini coefficient (0=uniform, 1=fully concentrated). Right: % effort in top-10% cells.")
+```
+
+---
+
+## 4.7 Channel fisheries context: fleet composition and trends
+
+This section places the quantitative results from Sections 4.1–4.6 in the broader context of the Channel fisheries literature. It draws on ICES WGCSE, STECF, Ifremer, MMO and peer-reviewed sources (see Section 3.1 for the literature selection approach).
+
+### 4.7.1 Fleet composition and dominant gear types
+
+The Channel (ICES 27.7.d/e) supports one of the most diverse and intensively fished areas in Europe. The French fleet dominates total effort in the eastern Channel, contributing over 60% of total AER fishing days in most years (ICES, 2024a; Ifremer, 2023), consistent with the AER results in Figure 1 which show France as the largest contributor across all gear categories. Bottom trawl/seine gears account for the largest share of demersal fishing effort, targeting mixed assemblages of flatfish, cephalopods and small pelagics. The Dutch flyshoot fleet expanded significantly through the 2010s (Quirijns et al., 2020), a trend visible in the AER and GFW series (Figures 1 and 10). Belgian beam trawl effort has declined substantially since the mid-2000s under pressure from fuel costs and quota restrictions (ILVO, 2022), consistent with the low and declining Belgian effort in beam trawl panels throughout the AER figures.
+
+The scallop dredge fishery is concentrated in the Baie de Seine (27.7.d) and western Channel (27.7.e), dominated by the French fleet with seasonal UK participation. Scallop landings from the Baie de Seine reached a record ~48,000 t in 2024–2025 (Ifremer, 2025). MSC certification has been granted for the Baie de Saint-Brieuc fishery (2022) and the Baie de Seine fishery (November 2024), covering the majority of French Channel scallop production (MSC, 2024). The AER landings data (Figures 5–7) confirm scallops as one of the highest-tonnage species in the study area, dominated by the French dredge fleet.
+
+Pot and trap fisheries targeting whelk (*Buccinum undatum*), crab and lobster are important to UK coastal communities, though the AER series shows limited representation of this segment at the fleet level. The whelk fishery in 27.7.d has grown markedly since the mid-2010s, driven by Asian export demand (MMO, 2023).
+
+### 4.7.2 Historical effort trends and structural change
+
+Total fishing effort in the Channel has declined substantially since the early 2000s, consistent with EU fleet capacity reduction programmes and quota restrictions under successive CFP reforms. The AER series (2008–2023) shows a general downward trend in fishing days for bottom trawl/seine and beam trawl across all major flag states (Figure 1), with the Dutch flyshoot fleet being an important exception showing growth through the 2010s before stabilising post-2020. This is consistent with Quirijns et al. (2020) and STECF (2024).
+
+Post-Brexit disruption from 2021 onwards has reshaped fleet access in the eastern Channel. UK licensing restrictions have reduced French, Belgian and Dutch access to UK waters in 27.7.d/e, driving spatial redistribution towards French EEZ waters (Phillipson & Symes, 2018; House of Lords, 2022). This structural shift may contribute to the apparent changes in spatial effort patterns visible in the GFW KDE maps (Figures 14–15) around 2021–2022, with effort concentrating in the southern (French EEZ) portion of 27.7.d. The 2024 gentlemen's agreement between VisNed, Rederscentrale and CNPMEM represents the most recent multilateral self-regulation initiative within this post-Brexit context.
+
+The GFW spatial concentration metrics (Figure 16) quantify whether this redistribution has led to more or less concentrated effort patterns over time. A rising Gini coefficient or top-10% share after 2021 would be consistent with effort being pushed into a narrower range of spatial locations following access restrictions.
+
+### 4.7.3 Stock status of key target species
+
+Table 2 summarises the assessment and advice status for the principal commercial stocks in the study area. Stocks are grouped by the ICES working group responsible for their assessment. Note that several species caught in the Channel — particularly cephalopods — do not have formal ICES assessments or TAC-based management; these are indicated accordingly.
+
+| Species | Common name | Stock / area | ICES WG | Assessment type | F vs F~MSY~ | SSB vs B~pa~ | TAC | Notes |
+|---------|-------------|-------------|---------|-----------------|-------------|-------------|-----|-------|
+| *Solea solea* | Common sole | 27.7.d | WGCSE | Analytical (XSA/SAM) | F > F~MSY~ | SSB < B~pa~ | Yes | Stock declining; below safe biological limits in recent years (ICES, 2024a) |
+| *Solea solea* | Common sole | 27.7.e | WGCSE | Analytical | F > F~MSY~ | SSB < B~pa~ | Yes | Similar trajectory to 7.d; partial overlap with 7.d stock (ICES, 2024a) |
+| *Pleuronectes platessa* | European plaice | 27.7.d/e | WGCSE | Analytical | F ≈ F~MSY~ | SSB > B~pa~ | Yes | Better status than sole; recovering trend since 2015 (ICES, 2024a) |
+| *Pleuronectes platessa* | European plaice | 27.4.c | WGNSSK | Analytical (SAM) | F < F~MSY~ | SSB > B~pa~ | Yes | Part of larger North Sea plaice stock; in good status (ICES, 2024c) |
+| *Lepidorhombus* spp. | Megrim | 27.7.d/e | WGCSE | Analytical | F > F~MSY~ | SSB variable | Yes | Mixed-species complex; overfished in recent assessments (ICES, 2024a) |
+| *Merlangius merlangus* | Whiting | 27.7.d/e | WGCSE | Analytical | F > F~MSY~ | SSB < B~pa~ | Yes | Chronically overfished; bycatch in many demersal gears (ICES, 2024a) |
+| *Lophius* spp. | Monkfish (anglerfish) | 27.7.b–k | WGCSE | Analytical | F ≈ F~MSY~ | SSB > B~pa~ | Yes | Relatively stable; two-species complex (*L. piscatorius* + *L. budegassa*) (ICES, 2024a) |
+| *Dicentrarchus labrax* | European sea bass | 27.4.b/c, 27.7.a–h | WGCSE | Analytical | F recovering | SSB recovering | Yes | Under recovery plan since 2015; improving but still constrained (ICES, 2024a) |
+| *Trachurus trachurus* | Atlantic horse mackerel | 27.7 (western stock) | WGWIDE | Analytical (XSA/SS3) | F < F~MSY~ | SSB > B~pa~ | Yes | Western stock; within safe biological limits; important flyshoot target (ICES, 2024e) |
+| *Scomber scombrus* | Atlantic mackerel | NE Atlantic | WGWIDE | Analytical (SAM) | F > F~MSY~ | SSB declining | Yes | Disputed stock; quota conflict between EU, UK, Norway, Iceland (ICES, 2024e) |
+| *Pecten maximus* | King scallop | 27.7.d Baie de Seine | Ifremer | Biomass survey | — | Recovering | Seasonal access | Record 2024–25 season; MSC certified Nov 2024 (Ifremer, 2025; MSC, 2024) |
+| *Pecten maximus* | King scallop | 27.7.d Baie de Saint-Brieuc | Ifremer | Biomass survey | — | Stable | Seasonal access | MSC certified 2022 (MSC, 2024) |
+| *Pecten maximus* | King scallop | 27.7.e western Channel | MMO/Cefas | Biomass survey | — | Declining | Seasonal access | UK MMO concerns; possible closures 2026–2027 (MMO, 2023) |
+| *Sepia officinalis* | Common cuttlefish | 27.7.d/e, 27.4.c | WGCEPH | No formal assessment | — | — | None (technical measures) | High interannual variability; sensitive to temperature; no TAC (ICES, 2024d) |
+| *Loligo vulgaris* | European squid | 27.7.d/e | WGCEPH | Biomass index only | — | — | None | Channel population; no formal stock assessment (ICES, 2024d) |
+| *Illex coindetii* | Broadtail shortfin squid | 27.7 | WGCEPH | No formal assessment | — | — | None | Occasional significant catches; highly variable recruitment (ICES, 2024d) |
+| *Chelidonichthys* spp. | Gurnards | Channel / NS | None | Not assessed | — | — | None | Bycatch species; no formal assessment or TAC |
+| *Buccinum undatum* | Common whelk | 27.7.d/e | None | Not assessed | — | — | None | UK export fishery; managed locally; no ICES assessment |
+| *Mullus surmuletus* | Striped red mullet | 27.7.d/e | WGCSE | Biomass index | — | — | None | Low TAC fishery; limited assessment capacity (ICES, 2024a) |
+
+Table 2. Principal commercial stocks in ICES 27.4.c/27.7.d/27.7.e: responsible ICES working group, assessment type, F/SSB status relative to reference points, TAC status and key notes. F~MSY~ = fishing mortality at maximum sustainable yield; B~pa~ = precautionary biomass reference point; WG = working group. Status characterisations based on most recent available ICES advice (2024 cycle). "—" indicates metric not formally estimated.
+
+The table highlights several important points relevant to the Channel fisheries context:
+
+**Flatfish stocks under pressure.** Both sole stocks (27.7.d and 27.7.e) are assessed as having fishing mortality above F~MSY~ and biomass below B~pa~, confirming the biological basis for the dramatic decline in landings visible in Figure 7. The AER-derived flatfish landings series (predominantly beam trawl) is a direct consequence of both reduced fleet capacity and stock depletion. Plaice in 27.7.d/e is in a better state, with biomass above B~pa~, consistent with the more modest landings decline for that species.
+
+**Cephalopods: unassessed but commercially critical.** Neither cuttlefish (*Sepia officinalis*) nor squid (*Loligo* spp.) have formal ICES assessments or TACs. Management relies on technical measures (mesh sizes, seasonal closures). WGCEPH (ICES, 2024d) monitors population trends through survey indices and standardised CPUE, but the high interannual variability — driven by temperature-dependent recruitment and one-year life cycles — makes conventional stock assessment unreliable. The stable AER cuttlefish landings (Figure 7) are therefore not a signal of a stable stock, but rather of a stock whose annual productivity fluctuates widely around a longer-term mean.
+
+**Horse mackerel and mackerel: widely distributed, WGWIDE-assessed.** Atlantic horse mackerel (*Trachurus trachurus*, western stock) and Atlantic mackerel (*Scomber scombrus*) are assessed by WGWIDE rather than WGCSE, reflecting their wide distribution across the North Atlantic rather than being confined to the Celtic Seas ecoregion. Horse mackerel is within safe biological limits and is an important flyshoot target in the Channel, contributing to the bottom trawl/seine landings visible in Figures 5 and 6 (ICES, 2024e). Mackerel is a more contentious case: the stock is considered to be fished above F~MSY~ and SSB is declining, with persistent quota disputes between the EU, UK, Norway and Iceland (ICES, 2024e). The Baie de Seine stock is at record biomass levels (Ifremer, 2025), but the western Channel stock assessed by MMO/Cefas is showing signs of decline, with closures under consideration. The contrast between the two sub-areas underlines the spatial heterogeneity of scallop productivity in the Channel.
+
+**No formal assessment for several bycatch species.** Gurnards, whelk and mullets — all visible in the AER landings data — have no ICES stock assessments. Their sustainability cannot currently be evaluated through the standard ICES framework.
+
+### 4.7.4 Ecosystem effects and sustainability
+
+The seabed disturbance footprint of the Channel fisheries has been extensively studied. Eigaard et al. (2017) quantified the swept-area ratio across European shelf fisheries and identified the Channel as one of the most intensively bottom-trawled areas in European waters, with beam trawl having the highest physical impact per unit effort. Comparisons between gear types consistently show that Danish seine (flyshoot) has a substantially lower seabed disturbance footprint than comparable otter trawls or beam trawls, primarily because it does not drag heavy groundgear across the seabed in the same manner (Depestele et al., 2016; Hiddink et al., 2017). This relative advantage is a key component of the sustainability argument for the flyshoot fishery.
+
+Bycatch and discards in the Channel mixed fisheries remain a management concern under the EU landing obligation (in force since 2019), though exemptions for high-survival species and *de minimis* provisions have reduced the practical scope of the obligation for many fleets (ICES WGCSE, 2024a). The flyshoot fishery is generally considered to have moderate bycatch rates compared to other demersal gears, though species composition of the bycatch varies considerably with area and season (Quirijns et al., 2020).
+
+---
+
+# 5. Discussion & Synthesis
+
+## 5.1 Effort trends and fleet position
+
+*Integrative interpretation of AER effort trends (Section 4.2–4.3) and GFW spatial patterns (Sections 4.4–4.6), cross-referenced with the fleet composition literature (Section 4.7 and 4.1). How has effort in the Channel developed since 2008/2013? What is the position of the Vrolijk fleet within the total effort picture? What do the post-Brexit and 2024 agreement trends show?*
+
+## 5.2 Comparison of AER and GFW effort metrics
+
+*Where AER and GFW tell the same story vs. where they diverge (see Figure 11 and Section 4.4.2). Limitations of each source. Note on why FDI was not used for primary analysis (see Section 3.5).*
+
+## 5.3 Compliance with the 2024 gentlemen's agreement
+
+*What does the available data show about compliance with sea-day limits and gear specifications? Contribution to the monitoring obligation under the 2024 agreement (Section 3.6).*
+
+## 5.4 Sustainability position
+
+*Synthesis drawing on the seabed disturbance literature (Section 4.7.4), stock status (Section 4.7.3) and the effort data (Sections 4.2–4.6). Evidence-based strengths (lower seabed disturbance than beam trawl, MSC-certified scallops, data transparency, compliance monitoring) and points requiring honest acknowledgement.*
+
+## 5.5 Responding to public criticism
+
+*How do the findings of this report relate to the critical media coverage of the flyshoot fishery (e.g. Follow the Money)? What is factually substantiated, what merits nuance, and what does the data not yet resolve?*
+
+---
+
+# 6. Conclusions & Recommendations
+
+## 6.1 Conclusions
+
+*[To be written after completion of analyses.]*
+
+## 6.2 Recommendations for sustainability communication
+
+*Recommendations for Vrolijk's communication towards clients, media, policy-makers. Suggestions for ongoing monitoring consistent with the 2024 agreement obligations.*
+
+---
+
+# 7. References
+
+Depestele, J., Ivanović, A., Degrendele, K., Esmaeili, M., Polet, H., Roche, M., … & Zenone, A. (2016). Measuring and assessing the physical impact of beam trawling. *ICES Journal of Marine Science*, 73(Suppl 1), i15–i26. https://doi.org/10.1093/icesjms/fsv056
+
+Eigaard, O. R., Bastardie, F., Hintzen, N. T., Buhl-Mortensen, L., Buhl-Mortensen, P., Catarino, R., … & Rijnsdorp, A. D. (2017). The footprint of bottom trawling in European waters: distribution, intensity, and seabed integrity. *ICES Journal of Marine Science*, 74(3), 847–865. https://doi.org/10.1093/icesjms/fsw194
+
+European Commission (2021). *Trade and Cooperation Agreement between the European Union and the United Kingdom — Fisheries provisions*. Publications Office of the EU.
+
+Hiddink, J. G., Jennings, S., Sciberras, M., Szostek, C. L., Hughes, K. M., Ellis, N., … & Kaiser, M. J. (2017). Global analysis of depletion and recovery of seabed biota after bottom trawling disturbance. *Proceedings of the National Academy of Sciences*, 114(31), 8301–8306. https://doi.org/10.1073/pnas.1618858114
+
+House of Lords (2022). *Post-Brexit fishing: the sea of opportunity that wasn't*. House of Lords Select Committee on the Environment and Climate Change, HL Paper 146.
+
+ICES (2024a). *Report of the Working Group on Celtic Seas Ecoregion (WGCSE)*. ICES Scientific Reports 6(52). https://doi.org/10.17895/ices.pub.26006529
+
+ICES (2024b). *ICES advice on fishing opportunities: Channel demersal stocks 2025*. ICES Advice 2024. https://www.ices.dk/advice
+
+ICES (2024c). *Report of the Working Group on the Assessment of Demersal Stocks in the North Sea and Skagerrak (WGNSSK)*. ICES Scientific Reports 6(42). https://doi.org/10.17895/ices.pub.25653482
+
+ICES (2024d). *Report of the Working Group on Cephalopod Fisheries and Life History (WGCEPH)*. ICES Scientific Reports 6(44). https://doi.org/10.17895/ices.pub.25652743
+
+ICES (2024e). *Report of the Working Group on Widely Distributed Stocks (WGWIDE)*. ICES Scientific Reports 6(45). https://doi.org/10.17895/ices.pub.25654012
+
+Ifremer (2023). *Bilan des pêches en France — Résultats des campagnes scientifiques et de la flotte de pêche commerciale*. Ifremer, Brest.
+
+Ifremer (2025). *Saison de pêche des coquilles Saint-Jacques en Manche — Bilan 2024–2025*. Note de synthèse, Ifremer Halieutique Manche-Mer du Nord.
+
+ILVO (2022). *Vlaamse visserij in cijfers 2021*. Instituut voor Landbouw-, Visserij- en Voedingsonderzoek (ILVO), Oostende.
+
+Kroodsma, D. A., Mayorga, J., Hochberg, T., Miller, N. A., Boerder, K., Ferretti, F., … & Worm, B. (2018). Tracking the global footprint of fisheries. *Science*, 359(6378), 904–908. https://doi.org/10.1126/science.aao5646
+
+MMO (2023). *UK Sea Fisheries Statistics 2022*. Marine Management Organisation, Newcastle upon Tyne. https://www.gov.uk/government/statistics/uk-sea-fisheries-statistics
+
+MSC (2024). *MSC certified fisheries — Scallop (Pecten maximus), English Channel*. Marine Stewardship Council. https://www.msc.org/fisheries
+
+Phillipson, J. & Symes, D. (2018). 'A sea of troubles': The Brexit crisis and the British fishing industry. *Marine Policy*, 90, 168–173. https://doi.org/10.1016/j.marpol.2017.12.016
+
+Quirijns, F. J., Henstra, P., & van Marlen, B. (2020). *Ontwikkeling van de Nederlandse vloot voor de flyshoot-visserij in het Kanaal en de Noordzee*. Wageningen Marine Research rapport C059/20. https://doi.org/10.18174/520773
+
+Seafish (2022). *The UK fishing industry post-Brexit — Quota, access and economic impacts*. Sea Fish Industry Authority, Edinburgh.
+
+STECF (2024). *STECF 25-07: EU Fleet Economic and Transversal data*. Scientific, Technical and Economic Committee for Fisheries, European Commission. https://stecf.jrc.ec.europa.eu/
+
+---
+
+# Annexes
+
+## Annex A — Data sources
+
+| Dataset | Source | Period | Role in this report |
+|---------|--------|--------|---------------------|
+| STECF AER | STECF 25-07 | 2008–2023 | Primary: effort trends, landings |
+| GFW Events API | GFW API v3 (`gfwr` 3.0) | 2013–2025 | Spatial analysis only |
+| GFW Vessel registry | GFW | 2013–2025 | Flag, gear type, GT |
+| STECF FDI | STECF 2025 release | 2013–2024 | QA reference only |
+| Offshore wind farm polygons | Crown Estate (UK); RVO/PZH (NL) | Current (2024) | Static overlay, Figures 12–13. DE source excluded (outside study area) |
+| Marine Protected Areas | EU Natura 2000 marine + UK MPAs (MPA_combined_EU_UK.RData) | Current | Simplified to 1 km tolerance for report maps; static overlay, Figures 12–13 |
+| ICES FAO shapefiles | ICES/FAO | — | ICES division polygons |
+
+## Annex B — Cache files
+
+Cache files are stored in `output/cache/` and are rebuilt automatically when source data are newer. Delete any file to force a full rebuild on the next knit.
+
+| File | Contents | Rebuilt when |
+|------|----------|--------------|
+| `cache_aer.RData` | `aer_effort_raw`, `aer_effort_summary`, `aer_effort_capacity_metric`, `aer_landings_raw`, `aer_landings_summary` | AER Excel file is newer |
+| `cache_gfw.RData` | `fishing_days_study`, `events_classified_fr`, `vessel_meta`, `fao_sf_division`, `world` | Any GFW pipeline `.RData` is newer |
+| `cache_gfw_spatial.RData` | KDE grids, gridded effort, concentration metrics | `cache_gfw.RData` is newer |
+| `cache_fdi.RData` | `fdi_days`, `fdi_catches` | FDI CSV outputs are newer |
+
+## Annex C — Code section index
+
+The table below maps each result in the report to the R code chunk or script section that generated it. All chunk names refer to `channel_fisheries_combined_report.Rmd` unless otherwise stated.
+
+| Figure / Table | Report section | Code chunk / script section | Source data |
+|----------------|---------------|------------------------------|-------------|
+| Figure 1 — Fishing days by gear | 4.2.1 | `aer-effort-trend` | `aer_effort_summary` (cache_aer) |
+| Figure 2 — Fishing days by vessel size | 4.2.2 | `aer-effort-gt` | `aer_effort_raw` (cache_aer) |
+| Figure 3 — Seasonal patterns | 4.2.3 | `aer-effort-seasonal` | `aer_effort_summary` (cache_aer) |
+| Figure 4 — Landed weight by gear | 4.3.1 | `aer-landings-total` | `aer_landings_summary` (cache_aer) |
+| Figure 5 — Landings by species and country | 4.3.2 | `aer-landings-species-country` | `aer_landings_summary` (cache_aer) |
+| Figure 6 — Landings by species and gear | 4.3.3 | `aer-landings-species-gear` | `aer_landings_summary` (cache_aer) |
+| Figure 7 — Focal species × focal gears | 4.3.4 | `aer-landings-focal` | `aer_landings_summary` (cache_aer) |
+| Figure 8 — Top 15 species | 4.3.5 | `aer-landings-top-species` | `aer_landings_summary` (cache_aer) |
+| Figure 10 — GFW days by flag state | 4.4.1 | `gfw-plot-flag-total` | `fishing_days_study` (cache_gfw) |
+| Figure 11 — AER vs GFW comparison | 4.4.2 | `aer-gfw-comparison` | `aer_effort_summary` + `fishing_days_study` |
+| Figure 12 — Spatial events, all years | 4.5.1 | `gfw-plot-spatial-all` | `events_classified_fr`, `vessel_meta` (cache_gfw); `windfarms_operational` (load-windfarms); `mpa_study` (load-mpa) |
+| Figure 13 — Spatial events by year | 4.5.2 | `gfw-plot-spatial-by-year` | `events_classified_fr`, `vessel_meta` (cache_gfw); `windfarms_operational` (load-windfarms); `mpa_study` (load-mpa) |
+| Figure 14 — KDE all divisions | 4.5.3 | `gfw-plot-kde` | `kde_results` (cache_gfw_spatial) |
+| Figure 15 — KDE ICES 27.7.D | 4.5.4 | `gfw-plot-kde-7d` | `kde_7d` (cache_gfw_spatial) |
+| Figure 16 — Gini and top-10% | 4.6.1 | `gfw-plot-concentration` | `concentration_7d` (cache_gfw_spatial) |
+| Table 1 — FDI exclusion summary | 3.5 | `fdi-note-table` | Hard-coded |
+| Table 2 — Stock status | 4.7.3 | Markdown table (no chunk) | ICES 2024a–e (literature) |
+
+**KDE computation** (`kde_results`, `kde_7d`): derived in the `load-gfw-spatial` chunk using `spatstat::density.ppp()` with bandwidth σ = `r sigma_all/1000` km (all divisions) and σ = `r sigma_7d/1000` km (27.7.D). Inputs are fishing event coordinates from `events_classified_fr`, sampled to `r kde_sample` events per year.
+
+**Concentration metrics** (`concentration_7d`): derived in `load-gfw-spatial` by aggregating events to a `r cell_size/1000` km × `r cell_size/1000` km grid covering ICES 27.7.D, then computing the Gini coefficient (`ineq::Gini()`) and top-10% cell share per year.
+
+**GFW pipeline scripts** (not part of this Rmd — run separately to regenerate the raw `.RData` files in `flyshootdir`):
+
+| Script / Rmd | Purpose | Output file |
+|---|---|---|
+| `GFW_effort_report.Rmd` sections 1–3 | Vessel discovery and metadata | `gfw_s3_vessel_meta.RData` |
+| `GFW_effort_report.Rmd` sections 4–6 | Event retrieval and zone classification | `gfw_s6_zones.RData` |
+| `GFW_effort_report.Rmd` section 7 | Effort aggregation to vessel-days | `gfw_s7_effort.RData` |
+| `AER_channel_analysis.R` | AER exploration and QA plots | (diagnostic output only) |
+| `FDI_channel_analysis.R` | FDI loading, cleaning, QA | `fdi_fishingdays_*.csv`, `fdi_catches_*.csv` |
+
+## Annex D — Supplementary figures
+
+*[Additional maps and charts not included in the main text.]*
+
+---
+
+# Session information
+
+```{r session-info}
+sessionInfo()
+```
