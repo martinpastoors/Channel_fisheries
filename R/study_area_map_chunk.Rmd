@@ -1,0 +1,223 @@
+```{r study-area-map, fig.height=6.5, fig.width=8, fig.cap=fig_nums("study_area")}
+
+# ---- Study area map: ICES divisions, countries and water depth ---------------
+# Depth: NOAA ETOPO 2022 global relief model at 1 arc-minute (~1.8 km),
+# downloaded once with marmap::getNOAA.bathy() (needs an internet connection
+# and the marmap package: install.packages("marmap")).
+# Depth grid and ICES division outlines are stored in cache_map.RData.
+# Delete that file to rebuild, e.g. after changing map_xlim / map_ylim.
+#
+# EEZ boundaries: Marine Regions World EEZ v12 boundary lines (Flanders Marine
+# Institute, 2023). Either set eez_file to a local copy of the boundaries
+# layer (e.g. "eez_boundaries_v12.shp" from https://www.marineregions.org/downloads.php),
+# or leave it NULL to download the layer once with the mregions2 package
+# (install.packages("mregions2")). Stored in cache_eez.RData.
+
+map_cache      <- file.path(cache_dir, "cache_map.RData")
+map_xlim       <- c(-6.5, 7.5)     # longitude range of the map
+map_ylim       <- c(48.2, 53.8)    # latitude range of the map
+show_windfarms <- TRUE             # draw operational/approved wind farms
+eez_cache      <- file.path(cache_dir, "cache_eez.RData")
+eez_file       <- NULL             # optional local EEZ boundaries file (shp/gpkg)
+
+if (file.exists(map_cache)) {
+
+  msg("Map: loading depth grid and ICES divisions from cache")
+  load(map_cache)   # bathy_df, ices_div_map
+
+} else {
+
+  msg("Map: downloading depth grid from NOAA (first knit only) ...")
+  bathy_df <- tryCatch({
+    b <- marmap::getNOAA.bathy(lon1 = map_xlim[1] - 0.5, lon2 = map_xlim[2] + 0.5,
+                               lat1 = map_ylim[1] - 0.5, lat2 = map_ylim[2] + 0.5,
+                               resolution = 1)
+    marmap::fortify.bathy(b)                 # columns x (lon), y (lat), z (m)
+  }, error = function(e) {
+    msg("Map: depth download failed (", conditionMessage(e),
+        "); the map is drawn without depth and the download is retried next knit.")
+    NULL
+  })
+
+  # All ICES divisions in the map window (study divisions are highlighted below)
+  s2_old <- sf::sf_use_s2()
+  sf::sf_use_s2(FALSE)
+  map_bbox <- sf::st_as_sfc(sf::st_bbox(c(xmin = map_xlim[1] - 1, xmax = map_xlim[2] + 1,
+                                          ymin = map_ylim[1] - 1, ymax = map_ylim[2] + 1),
+                                        crs = 4326))
+  fao_sf <- load_object(file.path(spatialdir, "fao_sf.RData"), "fao_sf")
+  ices_div_map <- fao_sf |>
+    filter(F_LEVEL == "DIVISION") |>
+    dplyr::select(division = F_DIVISION) |>
+    mutate(division = toupper(division)) |>
+    sf::st_transform(4326) |>
+    sf::st_make_valid() |>
+    sf::st_intersection(map_bbox) |>
+    group_by(division) |>
+    summarise(geometry = sf::st_union(geometry), .groups = "drop")
+  rm(fao_sf)
+  sf::sf_use_s2(s2_old)
+
+  if (!is.null(bathy_df)) {
+    save(bathy_df, ices_div_map, file = map_cache)
+    msg("Map: cache saved → ", map_cache)
+  }
+}
+
+# ---- EEZ boundaries ------------------------------------------------------------
+if (file.exists(eez_cache)) {
+
+  load(eez_cache)   # eez_lines
+
+} else {
+
+  eez_raw <- tryCatch({
+    if (!is.null(eez_file)) {
+      msg("Map: reading EEZ boundaries from ", eez_file)
+      sf::st_read(eez_file, quiet = TRUE)
+    } else {
+      msg("Map: downloading EEZ boundaries from Marine Regions (first knit only) ...")
+      mregions2::mrp_get("eez_boundaries")
+    }
+  }, error = function(e) {
+    msg("Map: EEZ boundaries not available (", conditionMessage(e),
+        "); the map is drawn without EEZs and this is retried next knit.")
+    NULL
+  })
+
+  eez_lines <- NULL
+  if (!is.null(eez_raw)) {
+    s2_old <- sf::sf_use_s2()
+    sf::sf_use_s2(FALSE)
+    eez_bbox <- sf::st_as_sfc(sf::st_bbox(c(xmin = map_xlim[1] - 1, xmax = map_xlim[2] + 1,
+                                            ymin = map_ylim[1] - 1, ymax = map_ylim[2] + 1),
+                                          crs = 4326))
+    eez_lines <- eez_raw |>
+      sf::st_transform(4326) |>
+      sf::st_make_valid() |>
+      sf::st_intersection(eez_bbox) |>
+      dplyr::select(geometry)
+    sf::sf_use_s2(s2_old)
+    rm(eez_raw)
+    save(eez_lines, file = eez_cache)
+    msg("Map: EEZ cache saved → ", eez_cache)
+  }
+}
+
+# EEZ names: fixed label positions (lon, lat); adjust if labels overlap
+eez_labels <- tibble::tribble(
+  ~label,              ~lon,   ~lat,
+  "UK EEZ",            -1.6,   50.30,
+  "French EEZ",        -0.9,   49.80,
+  "UK EEZ",             1.9,   52.30,
+  "Belgian EEZ",        2.75,  51.45,
+  "Dutch EEZ",          4.0,   52.85,
+  "German EEZ",         6.6,   53.70,
+  "Jersey / Guernsey", -2.6,   49.60
+)
+
+# ---- Depth classes ------------------------------------------------------------
+depth_breaks <- c(0, 20, 40, 60, 80, 100, 150, 200, Inf)
+depth_labels <- c("0–20", "20–40", "40–60", "60–80", "80–100",
+                  "100–150", "150–200", "> 200")
+depth_colours <- setNames(
+  colorRampPalette(c("#EAF3FA", "#9CC3E0", "#4A8BBF", "#1F4E79"))(length(depth_labels)),
+  depth_labels)
+
+depth_df <- if (!is.null(bathy_df)) {
+  bathy_df |>
+    filter(z < 0) |>
+    mutate(depth       = -z,
+           depth_class = cut(depth, breaks = depth_breaks, labels = depth_labels,
+                             include.lowest = TRUE))
+} else NULL
+
+# ---- Layers in geographic coordinates (WGS84) ---------------------------------
+study_div_map <- ices_div_map |>
+  filter(division %in% study_divisions_gfw)
+study_div_labels <- tibble::tibble(
+  division = c("27.4.C", "27.7.D", "27.7.E"),
+  lon      = c(2.6, 0.6, -4.3),
+  lat      = c(53.3, 50.25, 49.55)
+)
+other_div_labels <- ices_div_map |>
+  filter(!division %in% study_divisions_gfw) |>
+  sf::st_point_on_surface() |>
+  mutate(lon = sf::st_coordinates(geometry)[, 1],
+         lat = sf::st_coordinates(geometry)[, 2]) |>
+  sf::st_drop_geometry() |>
+  filter(between(lon, map_xlim[1] + 0.3, map_xlim[2] - 0.3),
+         between(lat, map_ylim[1] + 0.2, map_ylim[2] - 0.2))
+
+country_labels <- tibble::tribble(
+  ~label,            ~lon,  ~lat,
+  "United Kingdom",  -1.6,  52.4,
+  "France",           1.5,  48.6,
+  "Belgium",          4.6,  50.6,
+  "Netherlands",      5.7,  52.4,
+  "Germany",          7.2,  53.2,
+  "Channel Islands", -2.4,  49.15
+)
+
+windfarms_map <- if (show_windfarms && exists("wind_proj")) {
+  wind_proj |>
+    filter(STATUS %in% c("Approved", "Production")) |>
+    sf::st_transform(4326)
+} else NULL
+
+# ---- Plot ---------------------------------------------------------------------
+p_map <- ggplot()
+
+if (!is.null(depth_df)) {
+  p_map <- p_map +
+    geom_raster(data = depth_df, aes(x = x, y = y, fill = depth_class)) +
+    scale_fill_manual(values = depth_colours, name = "Depth (m)", drop = FALSE)
+}
+
+p_map <- p_map +
+  geom_sf(data = ices_div_map, fill = NA, colour = "grey45",
+          linewidth = 0.3, linetype = "dotted")
+
+if (!is.null(eez_lines)) {
+  p_map <- p_map +
+    geom_sf(data = eez_lines, colour = "#8B1A1A", linewidth = 0.45,
+            linetype = "dashed")
+}
+
+if (!is.null(windfarms_map)) {
+  p_map <- p_map +
+    geom_sf(data = windfarms_map, fill = "grey20", colour = "grey20",
+            linewidth = 0.1, alpha = 0.6)
+}
+
+p_map <- p_map +
+  geom_sf(data = world, fill = "grey88", colour = "grey55", linewidth = 0.25) +
+  geom_sf(data = study_div_map, fill = NA, colour = "black", linewidth = 0.8) +
+  geom_text(data = other_div_labels, aes(x = lon, y = lat, label = division),
+            size = 2.4, colour = "grey35") +
+  geom_label(data = study_div_labels, aes(x = lon, y = lat, label = division),
+             size = 3.2, fontface = "bold", fill = alpha("white", 0.8),
+             label.size = 0) +
+  geom_text(data = country_labels, aes(x = lon, y = lat, label = label),
+            size = 3, fontface = "italic", colour = "grey25") +
+  { if (!is.null(eez_lines))
+      geom_text(data = eez_labels, aes(x = lon, y = lat, label = label),
+                size = 2.6, colour = "#8B1A1A") } +
+  coord_sf(crs = 4326, xlim = map_xlim, ylim = map_ylim, expand = FALSE) +
+  labs(title    = "Study area: English Channel and southern North Sea",
+       subtitle = "ICES divisions 27.4.c, 27.7.d and 27.7.e (bold outline)",
+       caption  = paste0("Depth: NOAA ETOPO 2022 (1 arc-minute). Dotted grey lines: other ICES divisions.",
+                         if (!is.null(eez_lines))
+                           " Dashed red lines: EEZ boundaries (Marine Regions, World EEZ v12).",
+                         if (!is.null(windfarms_map))
+                           " Dark grey: offshore wind farms (operational or approved)."),
+       x = NULL, y = NULL) +
+  theme_bw() +
+  theme(panel.background = element_rect(fill = "#EAF3FA"),
+        panel.grid       = element_line(colour = "white", linewidth = 0.2),
+        legend.position  = "right",
+        plot.caption     = element_text(size = 7, colour = "grey40")) +
+  guides(fill = guide_legend(ncol = 1))
+
+p_map
+```

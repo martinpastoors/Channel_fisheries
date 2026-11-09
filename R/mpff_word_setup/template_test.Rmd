@@ -1,0 +1,139 @@
+---
+output:
+  officedown::rdocx_document:
+    reference_docx: "word_build/MPFF_report_reference_filled.docx"
+    reference_num: true            # section references give the number, e.g. "3.2"
+    plots:
+      style: "Illustration1"       # paragraph that holds the figure
+      align: center
+      topcaption: false
+      caption:
+        style: "Illustration Caption"
+        pre: "Figure "
+        sep: ": "
+    tables:
+      topcaption: true
+      caption:
+        style: "Table Caption"
+        pre: "Table "
+        sep: ": "
+---
+
+```{r setup, include=FALSE}
+# ==============================================================================
+# Test of the MPFF Word template with officedown
+# ==============================================================================
+# Build with build_report.R (fills in the cover page and footers first).
+# What to check in the result:
+#   - cover page and version history from MPFF_report_front.docx
+#   - table of contents, unnumbered and numbered headings in the MPFF styles
+#   - figure and table captions numbered by Word, with cross-references
+#   - a landscape page
+# ==============================================================================
+
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE,
+                      fig.width = 7, fig.height = 4, dpi = 200)
+
+library(officedown)
+library(officer)
+library(flextable)
+library(ggplot2)
+
+# Example data
+landings_example <- data.frame(
+  year    = rep(2015:2023, 3),
+  country = rep(c("FRA", "NLD", "GBR"), each = 9),
+  tonnes  = c(seq(40, 32, length.out = 9), seq(12, 10, length.out = 9), seq(20, 15, length.out = 9)) * 1000
+)
+```
+
+```{r front-page}
+# Cover page, citation and version history (filled in by build_report.R)
+block_pour_docx("word_build/MPFF_report_front_filled.docx")
+```
+
+::: {custom-style="Hheading 1"}
+Contents
+:::
+
+```{r toc}
+block_toc(level = 3)
+```
+
+<!---CHUNK_PAGEBREAK--->
+
+::: {custom-style="Hheading 1"}
+Executive summary
+:::
+
+This paragraph is in the template's Normal style. Headings below are numbered by the template; this heading uses the unnumbered style "Hheading 1".
+
+Total landings in the example data were `r format(round(sum(landings_example$tonnes)), big.mark = ",")` t. Inline numbers like this one are calculated when the report is knitted.
+
+# Introduction {#intro}
+
+## Background {#background}
+
+Section references are filled in by Word: the methods are described in Section \@ref(methods), and the results in Section \@ref(results-landings).
+
+## Objectives
+
+- First objective, as a bullet list.
+- Second objective.
+
+# Material & Methods {#methods}
+
+Figure \@ref(fig:landings-plot) shows the example landings, and Table \@ref(tab:landings-table) gives the same numbers as a table.
+
+# Results
+
+## Landings {#results-landings}
+
+```{r landings-plot, fig.cap="Landings (t) per year by country (example data)."}
+ggplot(landings_example, aes(x = year, y = tonnes / 1000, colour = country)) +
+  geom_line(linewidth = 1) +
+  geom_point() +
+  scale_y_continuous(limits = c(0, NA)) +
+  labs(x = "Year", y = "Landings (1000 t)", colour = "Country") +
+  theme_bw() +
+  theme(legend.position = "bottom")
+```
+
+```{r landings-table, tab.id="landings-table", tab.cap="Landings (t) per year by country (example data)."}
+landings_wide <- tidyr::pivot_wider(landings_example, names_from = country, values_from = tonnes)
+
+flextable(landings_wide) |>
+  colformat_num(j = -1, big.mark = ",", digits = 0) |>
+  colformat_num(j = 1, big.mark = "", digits = 0) |>
+  font(fontname = "Calibri", part = "all") |>
+  fontsize(size = 9, part = "all") |>
+  bold(part = "header") |>
+  autofit()
+```
+
+### A third-level heading
+
+Text under a third-level heading.
+
+<!---BLOCK_LANDSCAPE_START--->
+
+## A landscape page
+
+Wide tables or figures can be placed on a landscape page like this one.
+
+```{r wide-plot, fig.width=10, fig.height=4.5, fig.cap="The same figure on a landscape page."}
+ggplot(landings_example, aes(x = year, y = tonnes / 1000, fill = country)) +
+  geom_col() +
+  facet_wrap(~country) +
+  labs(x = "Year", y = "Landings (1000 t)") +
+  theme_bw() +
+  theme(legend.position = "none")
+```
+
+<!---BLOCK_LANDSCAPE_STOP--->
+
+# References
+
+::: {custom-style="Reference"}
+Pastoors, M.A. (2026). Example reference in the template's Reference style.
+:::
