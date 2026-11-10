@@ -142,7 +142,24 @@ harmonised_names <- c(
   SKA = "Skates and rays"
 )
 
-# Species group lookup — used in multiple landings plots
+# ==============================================================================
+# Species groups — replaces assign_species_group() and species_group_levels
+# in Channel_fisheries_functions.R
+# ==============================================================================
+# Changes compared with the previous version:
+#   - Roundfish now includes the other gadoids: pouting/bib, pollack, saithe,
+#     hake and ling (previously pouting and pollack were "Other demersal fish")
+#   - New group "Seabass & seabreams": European seabass, black seabream and
+#     other seabreams
+#   - New group "Elasmobranchs": sharks, skates and rays (catsharks,
+#     smooth-hounds, tope, thornback, blonde, spotted, undulate ray, etc.)
+#   - Common European bittersweet (GKL, Glycymeris glycymeris) is a bivalve and
+#     moves from "Other demersal fish" to "Shellfish & crustaceans"
+#   - "Other demersal fish" keeps the rest: conger, monkfish, John dory,
+#     wrasses, weevers and "marine fishes nei"
+#
+# The order of the conditions matters: the first one that matches wins.
+
 assign_species_group <- function(species_code, species_name) {
   sn <- tolower(species_name)
   case_when(
@@ -153,38 +170,52 @@ assign_species_group <- function(species_code, species_name) {
       species_code %in% c("MAC","MAS") |
       str_detect(sn, "horse mackerel|scad") |
       species_code %in% c("HOM","HMM","JAA","JAX")
-      ~ "Pelagic fish",
-
+    ~ "Pelagic fish",
+    
     # ---- Seaweeds -----------------------------------------------------------
     str_detect(sn, "seaweed|kelp|tangle|laminaria|fucus|ulva|algae|alga|macroalg") |
       species_code %in% c("LQD","LAH","SWX","SWA","SWB","SWC","SWD","SWE",
-                           "SWF","SWG","SWH","SWI","SWJ","SWK","SWL","SWM",
-                           "SWN","SWO","SWP","SWQ","SWR","SWS","SWT","SWU",
-                           "SWV","SWT","SWW","ASP","ULV","FUC","LAM","ALG")
-      ~ "Seaweeds",
-
+                          "SWF","SWG","SWH","SWI","SWJ","SWK","SWL","SWM",
+                          "SWN","SWO","SWP","SWQ","SWR","SWS","SWT","SWU",
+                          "SWV","SWW","ASP","ULV","FUC","LAM","ALG")
+    ~ "Seaweeds",
+    
     # ---- Cephalopods --------------------------------------------------------
     str_detect(sn, "cuttlefish|sepia") |
       species_code %in% c("CTC","CTL","CTZ","CTB","CTS","SEB","OCC")
-      ~ "Cuttlefish",
+    ~ "Cuttlefish",
     
     str_detect(sn, "squid|loligo|bobtail|ommastrep|shortfin") |
       species_code %in% c("SQC","SQR","SQE","SQM","LOL","LOG","SQS","SQZ",
-                           "SQX","EUR","BOC","SQI","OMS","TOD","NBS","OMP","ILL")
-      ~ "Squid",
-
+                          "SQX","EUR","BOC","SQI","OMS","TOD","NBS","OMP","ILL")
+    ~ "Squid",
+    
     # ---- Demersal fish ------------------------------------------------------
     str_detect(sn, "mullet") |
       species_code %in% c("MUL","MUG","TFM","MUT","MUX")
-      ~ "Mullets",
+    ~ "Mullets",
     
     str_detect(sn, "gurnard|searobin") |
       species_code %in% c("GUG","GUR","GUU","GUX","TUB","BIR")
-      ~ "Gurnards",
+    ~ "Gurnards",
     
-    str_detect(sn, "whiting|haddock|cod") |
-      species_code %in% c("WHG","HAD", "COD")
-      ~ "Roundfish",
+    # Gadoids: cod, haddock, whiting, pouting, pollack, saithe, hake, ling
+    str_detect(sn, "whiting|haddock|\\bcod\\b|pouting|\\bbib\\b|pollack|pollock|saithe|\\bhake\\b|\\bling\\b") |
+      species_code %in% c("WHG","HAD","COD","BIB","POL","POK","HKE","LIN")
+    ~ "Roundfish",
+    
+    # Seabass and seabreams (before the elasmobranchs, so that "Ray's bream"
+    # is not taken for a ray)
+    str_detect(sn, "seabass|sea bass|seabream|sea bream|porgies|\\bbass\\b|bream") |
+      species_code %in% c("BSS","BRB","SBR","SBG","SBA","SBX","DEX")
+    ~ "Seabass & seabreams",
+    
+    # Elasmobranchs: sharks, skates and rays
+    str_detect(sn, "\\bray\\b|\\brays\\b|skate|shark|dogfish|catshark|smooth.?hound|spurdog|torpedo") |
+      species_code %in% c("SYC","SYT","SDV","SMD","GAG","DGS","DGH","SCK","SDS",
+                          "RJC","RJH","RJB","RJN","RJM","RJI","RJU","RJE","RJA",
+                          "RJF","RJO","RAJ","SKA","SRX","TTO")
+    ~ "Elasmobranchs",
     
     species_code %in% c(
       "SOL","SOM","SOO","SOZ",
@@ -197,40 +228,41 @@ assign_species_group <- function(species_code, species_name) {
       "SXS","CET",
       "FLX","FLO","BUT","RHG"
     ) |
-    str_detect(sn, "plaice|\\bsole\\b|turbot|brill|\\bdab\\b|flounder|halibut|megrim|witch|limande|cardine|fletan|plie|pliee")
-      ~ "Flatfishes",
-
+      str_detect(sn, "plaice|\\bsole\\b|turbot|brill|\\bdab\\b|flounder|halibut|megrim|witch|limande|cardine|fletan|plie|pliee")
+    ~ "Flatfishes",
+    
     # ---- Shellfish & invertebrates ------------------------------------------
     str_detect(sn, "scallop|pecten") |
       species_code %in% c("SCE","QSC","PEC","SCA","SCB")
-      ~ "Scallops",
+    ~ "Scallops",
+    
     str_detect(sn, "shrimp|crangon|pandalus|crevette") |
-      species_code %in% c("CSH","PRA","TGS","CRG","CPR","SQS","PAN","CFW")
-      ~ "Shrimps",
+      species_code %in% c("CSH","PRA","TGS","CRG","CPR","PAN","CFW")
+    ~ "Shrimps",
     
     # ---- Other shellfish & crustaceans --------------------------------------
-    str_detect(sn, "whelk|buccin|crab|lobster|crawfish|langoustine|nepthrops|venus|mussel|clam|cockle|oyster") |
+    str_detect(sn, "whelk|buccin|crab|lobster|crawfish|langoustine|nephrops|venus|mussel|clam|cockle|oyster|bittersweet|glycymeris") |
       species_code %in% c("WHE","BUC","CRE","SCR","LBE","NEP","VEV",
-                           "MYV","MYE","COC","OYF","OYG","CLX","SCX")
-      ~ "Shellfish & crustaceans",
-
+                          "MYV","MYE","COC","OYF","OYG","CLX","SCX","GKL")
+    ~ "Shellfish & crustaceans",
+    
     # ---- Other demersal fish ------------------------------------------------
-    str_detect(sn, "seabream|seabass|bass|bream|pouting|bib|pollack|pollock|conger|catshark|smooth.hound|ray|skate|shark|dogfish") |
-      species_code %in% c("BRB","BSS","BIB","POL","COE","SYC","SDV",
-                           "RJC","RJH","RJB","RJN","RJM","RJI","SKA",
-                           "DGS","DGH","SCK","SDS","GKL","MZZ")
-      ~ "Other demersal fish",
+    str_detect(sn, "conger|monkfish|anglerfish|john dory|\\bdory\\b|wrasse|weever|marine fishes") |
+      species_code %in% c("COE","MON","ANF","MNZ","JOD","WRA","USB","WEG","MZZ")
+    ~ "Other demersal fish",
+    
     TRUE ~ NA_character_
   )
 }
 
-# Ordered factor levels — pelagic and seaweed added at top
+# Ordered factor levels (also the order in the figures and tables)
 species_group_levels <- c("Pelagic fish", "Seaweeds",
-                           "Cuttlefish", "Squid",
-                           "Mullets", "Gurnards", "Roundfish",
-                           "Flatfishes", "Scallops", "Shrimps",
+                          "Cuttlefish", "Squid",
+                          "Mullets", "Gurnards", "Roundfish",
+                          "Seabass & seabreams", "Elasmobranchs",
+                          "Flatfishes", "Scallops", "Shrimps",
                           "Shellfish & crustaceans",
-                           "Other demersal fish")
+                          "Other demersal fish")
 
 # ---- Pelagic data anomaly flag ----------------------------------------------
 # NLD VL40XX Other/mixed pelagic landings in 27.4.C in 2012 are anomalously
@@ -833,18 +865,21 @@ read_gfw <- function(gfw_files, divisions) {
        world = world)
 }
 
-# Spatial objects, KDE and concentration metrics.
-# Object names ending in "_7d" refer to the focus division (focus_div_gfw).
-build_gfw_spatial <- function(events_classified_fr, 
-                              fao_sf_division, 
+# Spatial objects, KDE and concentration metrics for the whole study area.
+# Returns a list with:
+#   land_study, study_window_proj, study_owin, world_proj, fao_div_proj
+#                        spatial objects for the maps and the KDE window
+#   kde_results          KDE per year (sample of kde_sample events per year)
+#   cell_effort_all      number of events per grid cell and year (all events)
+#   concentration_full   Gini coefficient and top-10% cell share per year
+build_gfw_spatial <- function(events_classified_fr,
+                              fao_sf_division,
                               world,
-                              xlim, ylim, 
-                              focus_div_gfw, 
+                              xlim, ylim,
                               years,
-                              crs_proj, 
-                              sigma_all, 
-                              sigma_7d, 
-                              kde_sample, 
+                              crs_proj,
+                              sigma_all,
+                              kde_sample,
                               cell_size) {
 
   # ---- Base spatial objects ----------------------------------------------------
@@ -863,29 +898,21 @@ build_gfw_spatial <- function(events_classified_fr,
   world_proj        <- world           %>% st_transform(crs_proj)
   fao_div_proj      <- fao_sf_division %>% st_transform(crs_proj)
 
-  # ---- Focus division spatial objects -------------------------------------------
-  bbox_7d <- st_bbox(fao_sf_division %>% filter(division == focus_div_gfw))
-  land_7d <- world %>% st_crop(bbox_7d) %>% st_union()
-  window_7d_sf <- fao_sf_division %>%
-    filter(division == focus_div_gfw) %>%
-    st_difference(land_7d) %>%
-    st_make_valid()
-  window_7d_proj <- window_7d_sf %>% st_transform(crs_proj)
-  window_7d_owin <- as.owin(window_7d_proj)
-  bbox_7d_proj   <- st_bbox(window_7d_proj)
-
-  # ---- KDE — whole study area -----------------------------------------------------
-  events_for_kde_proj <- events_classified_fr %>%
+  # ---- Event positions in projected coordinates (all events) ----------------------
+  events_proj <- events_classified_fr %>%
     mutate(year = lubridate::year(start)) %>%
     filter(year %in% years, !is.na(lon), !is.na(lat)) %>%
     dplyr::select(year, lon, lat) %>%
-    group_by(year) %>%
-    slice_sample(n = kde_sample) %>%
-    ungroup() %>%
     st_as_sf(coords = c("lon", "lat"), crs = 4326) %>%
     st_transform(crs_proj) %>%
     mutate(x = st_coordinates(.)[, 1], y = st_coordinates(.)[, 2]) %>%
     st_drop_geometry()
+
+  # ---- KDE per year (sample of kde_sample events per year) -------------------------
+  events_for_kde_proj <- events_proj %>%
+    group_by(year) %>%
+    slice_sample(n = kde_sample) %>%
+    ungroup()
 
   kde_one <- function(pts, window, sigma, yr) {
     if (nrow(pts) < 50) return(NULL)
@@ -902,99 +929,37 @@ build_gfw_spatial <- function(events_classified_fr,
   kde_results <- map_dfr(years, \(yr)
     kde_one(events_for_kde_proj %>% filter(year == yr), study_owin, sigma_all, yr))
 
-  # ---- KDE — focus division ---------------------------------------------------------
-  events_7d_proj <- events_classified_fr %>%
-    mutate(year = lubridate::year(start)) %>%
-    filter(year %in% years, toupper(division) == focus_div_gfw,
-           !is.na(lon), !is.na(lat)) %>%
-    dplyr::select(year, lon, lat) %>%
-    st_as_sf(coords = c("lon", "lat"), crs = 4326) %>%
-    st_transform(crs_proj) %>%
-    mutate(x = st_coordinates(.)[, 1], y = st_coordinates(.)[, 2]) %>%
-    st_drop_geometry()
-
-  kde_7d <- map_dfr(years, \(yr)
-    kde_one(events_7d_proj %>% filter(year == yr), window_7d_owin, sigma_7d, yr))
-
-  # ---- Grid-cell effort — focus division ----------------------------------------------
-  events_7d_grid <- events_7d_proj %>%
-    mutate(
-      x_cell  = floor(x / cell_size) * cell_size + cell_size / 2,
-      y_cell  = floor(y / cell_size) * cell_size + cell_size / 2,
-      cell_id = paste(x_cell, y_cell, sep = "_"))
-
-  cell_effort_7d <- events_7d_grid %>%
-    group_by(year, cell_id, x_cell, y_cell) %>%
-    summarise(n_events = n(), .groups = "drop")
-
-  # Full grid (including zero-effort cells) for hotspot maps
-  x_range <- seq(floor(min(cell_effort_7d$x_cell) / cell_size) * cell_size,
-                 ceiling(max(cell_effort_7d$x_cell) / cell_size) * cell_size, by = cell_size)
-  y_range <- seq(floor(min(cell_effort_7d$y_cell) / cell_size) * cell_size,
-                 ceiling(max(cell_effort_7d$y_cell) / cell_size) * cell_size, by = cell_size)
-
-  full_grid_sf <- expand_grid(year = years, x_cell = x_range, y_cell = y_range) %>%
-    st_as_sf(coords = c("x_cell", "y_cell"), crs = crs_proj, remove = FALSE) %>%
-    st_filter(window_7d_proj %>% st_buffer(cell_size / 2)) %>%
-    st_drop_geometry()
-
-  cell_effort_full <- full_grid_sf %>%
-    left_join(cell_effort_7d %>% dplyr::select(year, x_cell, y_cell, n_events),
-              by = c("year", "x_cell", "y_cell")) %>%
-    replace_na(list(n_events = 0)) %>%
-    group_by(year) %>%
-    mutate(ndensity = n_events / max(n_events)) %>%
-    ungroup()
-
-  # ---- Concentration metrics ----------------------------------------------------------
-  # Gini coefficient and share of effort in the top-10% cells, per year
-  conc_metrics <- function(cell_effort) {
-    cell_effort %>%
-      group_by(year) %>%
-      summarise(
-        n_cells      = n(),
-        total_events = sum(n_events),
-        gini         = ineq::Gini(n_events),
-        top10_pct    = {
-          s     <- sort(n_events, decreasing = TRUE)
-          n_top <- max(1L, ceiling(0.10 * length(s)))
-          sum(s[seq_len(n_top)]) / sum(s) * 100
-        },
-        .groups = "drop")
-  }
-  
-  # Focus division
-  concentration_7d <- conc_metrics(cell_effort_7d)
-  
-  # ---- Grid-cell effort and concentration — whole study area -----------------------
-  # All events (not the KDE sample), on the same grid as the focus division
-  cell_effort_all <- events_classified_fr %>%
-    mutate(year = lubridate::year(start)) %>%
-    filter(year %in% years, !is.na(lon), !is.na(lat)) %>%
-    dplyr::select(year, lon, lat) %>%
-    st_as_sf(coords = c("lon", "lat"), crs = 4326) %>%
-    st_transform(crs_proj) %>%
-    mutate(x = st_coordinates(.)[, 1], y = st_coordinates(.)[, 2]) %>%
-    st_drop_geometry() %>%
+  # ---- Grid-cell effort (all events, not the KDE sample) -----------------------------
+  cell_effort_all <- events_proj %>%
     mutate(
       x_cell  = floor(x / cell_size) * cell_size + cell_size / 2,
       y_cell  = floor(y / cell_size) * cell_size + cell_size / 2,
       cell_id = paste(x_cell, y_cell, sep = "_")) %>%
     group_by(year, cell_id, x_cell, y_cell) %>%
     summarise(n_events = n(), .groups = "drop")
-  
-  concentration_full <- conc_metrics(cell_effort_all)
-  
-  list(land_study = land_study, study_window_proj = study_window_proj,
-       study_owin = study_owin, world_proj = world_proj, fao_div_proj = fao_div_proj,
-       bbox_7d_proj = bbox_7d_proj, window_7d_proj = window_7d_proj,
-       window_7d_owin = window_7d_owin,
-       kde_results = kde_results, 
-       kde_7d = kde_7d,
-       cell_effort_7d = cell_effort_7d, 
-       cell_effort_full = cell_effort_full,
-       concentration_7d = concentration_7d,
-       cell_effort_all = cell_effort_all, 
+
+  # ---- Concentration metrics per year ------------------------------------------------
+  # Gini coefficient and share of effort in the top-10% cells (cells with effort)
+  concentration_full <- cell_effort_all %>%
+    group_by(year) %>%
+    summarise(
+      n_cells      = n(),
+      total_events = sum(n_events),
+      gini         = ineq::Gini(n_events),
+      top10_pct    = {
+        s     <- sort(n_events, decreasing = TRUE)
+        n_top <- max(1L, ceiling(0.10 * length(s)))
+        sum(s[seq_len(n_top)]) / sum(s) * 100
+      },
+      .groups = "drop")
+
+  list(land_study         = land_study,
+       study_window_proj  = study_window_proj,
+       study_owin         = study_owin,
+       world_proj         = world_proj,
+       fao_div_proj       = fao_div_proj,
+       kde_results        = kde_results,
+       cell_effort_all    = cell_effort_all,
        concentration_full = concentration_full)
 }
 
@@ -1123,10 +1088,10 @@ with_cache <- function(cache, sources, objects, build, label,
 # Call this on any flextable to apply consistent report formatting.
 # Adjust font, size and colours once here; all tables update automatically.
 
-style_ft <- function(ft, font_size = 6, font_name = "Calibri") {
+style_ft <- function(ft, font_size = 6, font_name = "Calibri", max_width = 6.5) {
   n_rows <- nrow(ft$body$dataset)
-
-  ft |>
+  
+  ft <- ft |>
     flextable::font(fontname = font_name, part = "all") |>
     flextable::fontsize(size = font_size,     part = "body") |>
     flextable::fontsize(size = font_size + 1, part = "header") |>
@@ -1142,9 +1107,19 @@ style_ft <- function(ft, font_size = 6, font_name = "Calibri") {
     flextable::hline_bottom(part = "body",
                             border = officer::fp_border(width = 1.5)) |>
     flextable::colformat_num(big.mark = ",", digits = 0) |>
-    flextable::set_table_properties(layout = "autofit", width = 1) |>
-    flextable::align(j = -1, align = "right", part = "all") |>
-    flextable::align(j = 1,  align = "left",  part = "all")
+    flextable::align(align = "left", part = "all") |>
+    flextable::autofit()                                 # column widths from the content
+  
+  # Never wider than the text width of the page: scale all columns down
+  # proportionally (long texts then wrap within their cells)
+  col_widths <- dim(ft)$widths
+  if (sum(col_widths) > max_width) {
+    ft <- flextable::width(ft, width = col_widths * max_width / sum(col_widths))
+  }
+  
+  # Keep these widths in Word (no stretching) and place the table on the left
+  ft |>
+    flextable::set_table_properties(layout = "fixed", align = "left")
 }
 
 # ---- Shared table builder ---------------------------------------------------

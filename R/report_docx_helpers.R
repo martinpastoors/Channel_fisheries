@@ -1,18 +1,18 @@
 # ==============================================================================
 # Helpers to knit an Rmd into the MPFF Word template
 # ==============================================================================
-# word_template/MPFF_report_reference.docx
+# R/word_template/MPFF_report_reference.docx  (shared by all reports)
 #     The MPFF report template (.dotx) converted to a .docx, used as
 #     reference_docx: all styles, heading numbering, page layout and footers.
 #     The footers contain the placeholders {{short_title}} and {{author}}.
-# word_template/MPFF_report_front.docx
+# R/reports/<report>/front_<report>.docx  (one per report)
 #     Cover page, citation and version history. Contains the placeholders
 #     {{title}}, {{subtitle}}, {{author}}, {{date}}, {{client}},
 #     {{report_no}} and {{citation}}. The version history table is edited
 #     directly in this file in Word.
 #
-# prepare_word_files() fills in the placeholders and writes both files to
-# word_build/, where the Rmd picks them up. Edit the templates in Word if the
+# prepare_word_files() fills in the placeholders and writes both files to the
+# report's word_build/ folder, where the Rmd picks them up. Edit the templates in Word if the
 # layout should change; keep each {{placeholder}} as one piece of text in one
 # formatting (retype it in one go if Word splits it).
 # ==============================================================================
@@ -75,21 +75,22 @@ fill_docx_placeholders <- function(template, output, values) {
   invisible(output)
 }
 
-# ---- Fill both template files for one report -----------------------------------------
-prepare_word_files <- function(values,
-                               template_dir = "word_template",
-                               build_dir    = "word_build") {
+# ---- Fill the reference template and the report's front page ------------------------
+# reference_template : shared MPFF template (styles, footers), R/word_template/
+# front_template     : this report's cover page and version history
+# build_dir          : where the filled copies are written (not under Git)
+prepare_word_files <- function(values, reference_template, front_template, build_dir) {
 
   if (!dir.exists(build_dir)) dir.create(build_dir, recursive = TRUE)
 
   reference <- fill_docx_placeholders(
-    template = file.path(template_dir, "MPFF_report_reference.docx"),
-    output   = file.path(build_dir,    "MPFF_report_reference_filled.docx"),
+    template = reference_template,
+    output   = file.path(build_dir, "MPFF_report_reference_filled.docx"),
     values   = values)
 
   front <- fill_docx_placeholders(
-    template = file.path(template_dir, "MPFF_report_front.docx"),
-    output   = file.path(build_dir,    "MPFF_report_front_filled.docx"),
+    template = front_template,
+    output   = file.path(build_dir, "MPFF_report_front_filled.docx"),
     values   = values)
 
   invisible(c(reference = reference, front = front))
